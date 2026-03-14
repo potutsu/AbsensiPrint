@@ -1,505 +1,893 @@
-// ============================================================
-// AbsensiPrint — Attendance Report Printer
-// Drop this into a React + Vite StackBlitz project
-// Run: npm install xlsx
-// ============================================================
-
-import { useState, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import * as XLSX from 'xlsx'
 
-// ============================================================
-// DEFAULTS & CONSTANTS
-// ============================================================
+/* ═══════════════════════════════════════════════════
+   UTILITIES
+═══════════════════════════════════════════════════ */
 
-const DEFAULT_SETTINGS = {
-  workStart: '08:00',
-  workEnd: '17:00',
-  gracePeriod: 5,
-  overtimeMin: 0,
-  printFontSize: 'normal',
-  sheetIndex: 4,
-  blockWidth: 15,
-  nameRow: 2,
-  nameColOffset: 9,
-  dataStartRow: 11,
-  workDays: [1, 2, 3, 4, 5],
-}
-
-const PAGES = { UPLOAD: 'upload', LIST: 'list', DETAIL: 'detail', SETTINGS: 'settings' }
-
-// ============================================================
-// UTILITIES
-// ============================================================
-
-function timeToMinutes(t) {
+const timeToMins = (t) => {
   if (!t || typeof t !== 'string') return null
-  const [h, m] = t.trim().split(':').map(Number)
+  const parts = t.trim().split(':')
+  if (parts.length < 2) return null
+  const h = parseInt(parts[0]), m = parseInt(parts[1])
   if (isNaN(h) || isNaN(m)) return null
   return h * 60 + m
 }
 
-function minsToHHMM(m) {
-  if (m === null || m === undefined || m < 0) return '-'
-  const h = Math.floor(m / 60)
-  const mm = m % 60
-  return h > 0 ? `${h}j ${mm}m` : `${mm}m`
+const minsToDisplay = (mins) => {
+  if (!mins || mins <= 0) return '0'
+  const h = Math.floor(mins / 60), m = mins % 60
+  if (h === 0) return `${m}m`
+  if (m === 0) return `${h}j`
+  return `${h}j ${m}m`
 }
 
-function minsToTimeStr(mins) {
-  if (mins === null) return '-'
-  return `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`
+const formatDate = (date) => {
+  if (!date) return ''
+  return `${String(date.getDate()).padStart(2,'0')}/${String(date.getMonth()+1).padStart(2,'0')}`
 }
 
-function parseDayStr(s) {
-  const map = { Su: 0, Mo: 1, Tu: 2, We: 3, Th: 4, Fr: 5, Sa: 6 }
-  if (!s) return null
-  const parts = s.trim().split(' ')
-  if (parts.length < 2) return null
-  return { day: parseInt(parts[0], 10), weekday: map[parts[1]] ?? -1 }
+const DEFAULT_SETTINGS = {
+  scheduleStart: '08:00',
+  scheduleEnd: '17:00',
+  graceMinutes: '5',
+  includeSaturday: false,
+  printFontSize: 'normal',
+  // Sheet column mapping
+  sheetIndex: '4',
+  blockWidth: '15',
+  nameRow: '2',
+  nameOffset: '9',
+  idRow: '3',
+  idOffset: '9',
+  dataStartRow: '11',
+  amInOffset: '1',
+  amOutOffset: '3',
+  pmInOffset: '6',
+  pmOutOffset: '8',
+  otInOffset: '10',
+  otOutOffset: '12',
+  // Bluetooth
+  btPreset: 'generic',
+  btServiceUUID: '0000ff00-0000-1000-8000-00805f9b34fb',
+  btCharUUID: '0000ff02-0000-1000-8000-00805f9b34fb',
 }
 
-function loadSettings() {
-  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem('absensi_v1') || '{}') } }
-  catch { return { ...DEFAULT_SETTINGS } }
+const BT_PRESETS = {
+  generic:  { label: 'Generic BLE Printer',  svc: '0000ff00-0000-1000-8000-00805f9b34fb', chr: '0000ff02-0000-1000-8000-00805f9b34fb' },
+  pt210:    { label: 'PT-210 / EC204',        svc: '000018f0-0000-1000-8000-00805f9b34fb', chr: '00002af1-0000-1000-8000-00805f9b34fb' },
+  rongta:   { label: 'Rongta / Xprinter BLE', svc: '49535343-fe7d-4ae5-8fa9-9fafd205e455', chr: '49535343-8841-43f4-a8d4-ecbe34729bb3' },
+  custom:   { label: 'Custom (manual)',        svc: '',                                     chr: '' },
 }
 
-function saveSettingsStorage(s) {
-  localStorage.setItem('absensi_v1', JSON.stringify(s))
-}
+/* ═══════════════════════════════════════════════════
+   FILE PARSER
+═══════════════════════════════════════════════════ */
 
-// ============================================================
-// PARSER
-// ============================================================
-
-function parseFile(workbook, cfg) {
-  const sheetName = workbook.SheetNames[cfg.sheetIndex]
-  if (!sheetName) throw new Error(`Sheet ke-${cfg.sheetIndex + 1} tidak ditemukan. Cek "Index Sheet" di Pengaturan.`)
+function parseFile(workbook, s) {
+  const idx = parseInt(s.sheetIndex)
+  const sheetName = workbook.SheetNames[idx]
+  if (!sheetName) throw new Error(`Sheet ke-${idx+1} tidak ditemukan. File ini hanya punya ${workbook.SheetNames.length} sheet.`)
   const sheet = workbook.Sheets[sheetName]
   const data = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
 
-  const startMin = timeToMinutes(cfg.workStart)
-  const endMin = timeToMinutes(cfg.workEnd)
-  const grace = Number(cfg.gracePeriod) || 0
-  const otBuffer = Number(cfg.overtimeMin) || 0
-
-  const nameRow = data[cfg.nameRow] || []
-  const employees = []
-
-  for (let col = 0; col < nameRow.length; col += cfg.blockWidth) {
-    const name = String(nameRow[col + cfg.nameColOffset] || '').trim()
-    if (!name || name.toLowerCase() === 'name') continue
-
-    const noRow = data[3] || []
-    const empNo = String(noRow[col + cfg.nameColOffset] || '').trim()
-
-    const days = []
-    for (let r = cfg.dataStartRow; r < data.length; r++) {
-      const row = data[r] || []
-      const dateStr = String(row[col] || '').trim()
-      if (!dateStr) continue
-      const dayInfo = parseDayStr(dateStr)
-      if (!dayInfo || dayInfo.day < 1) continue
-
-      const amIn  = String(row[col + 1]  || '').trim()
-      const amOut = String(row[col + 3]  || '').trim()
-      const pmIn  = String(row[col + 6]  || '').trim()
-      const pmOut = String(row[col + 8]  || '').trim()
-      const otIn  = String(row[col + 10] || '').trim()
-      const otOut = String(row[col + 12] || '').trim()
-
-      const isAbsent = pmIn === 'Absence' || amIn === 'Absence'
-      const isWeekend = !cfg.workDays.includes(dayInfo.weekday)
-
-      let firstIn = null, lastOut = null, lateMin = 0, otMin = 0
-
-      if (!isAbsent && !isWeekend) {
-        const ins  = [amIn, pmIn, otIn].map(timeToMinutes).filter(v => v !== null)
-        const outs = [amOut, pmOut, otOut].map(timeToMinutes).filter(v => v !== null)
-        firstIn = ins.length  ? Math.min(...ins)  : null
-        lastOut = outs.length ? Math.max(...outs) : null
-        if (firstIn !== null) lateMin = Math.max(0, firstIn - (startMin + grace))
-        if (lastOut !== null) otMin = Math.max(0, lastOut - endMin - otBuffer)
+  // Parse period string
+  let period = '', startDate = null
+  for (const row of data.slice(0, 6)) {
+    for (const cell of row) {
+      if (typeof cell === 'string' && cell.includes('~')) {
+        period = cell.trim()
+        const m = period.match(/(\d{4})\/(\d{2})\/(\d{2})/)
+        if (m) startDate = new Date(+m[1], +m[2] - 1, +m[3])
+        break
       }
+    }
+    if (period) break
+  }
 
-      days.push({
-        dateStr, dayInfo,
-        amIn: isAbsent ? '' : amIn, amOut,
-        pmIn: isAbsent ? '' : pmIn, pmOut,
-        otIn, otOut,
-        isAbsent, isWeekend,
-        firstIn, lastOut,
-        lateMin, otMin,
-      })
+  const bw     = parseInt(s.blockWidth)
+  const nRow   = parseInt(s.nameRow)
+  const nOff   = parseInt(s.nameOffset)
+  const idRow  = parseInt(s.idRow)
+  const idOff  = parseInt(s.idOffset)
+  const dStart = parseInt(s.dataStartRow)
+
+  const employees = []
+  let blockCol = 0, attempts = 0
+
+  while (attempts < 60) {
+    attempts++
+    const nameVal = String(data[nRow]?.[blockCol + nOff] || '').trim()
+    if (!nameVal || nameVal === 'Name' || nameVal === 'Dept.') {
+      blockCol += bw
+      if (blockCol > (data[nRow]?.length || 0) + bw) break
+      continue
     }
 
-    const workDaysList = days.filter(d => !d.isWeekend)
-    const present  = workDaysList.filter(d => !d.isAbsent && d.firstIn !== null)
-    const absent   = workDaysList.filter(d => d.isAbsent)
-    const totalLate = present.reduce((s, d) => s + d.lateMin, 0)
-    const totalOT   = days.reduce((s, d) => s + d.otMin, 0)
+    const idVal = String(data[idRow]?.[blockCol + idOff] || '').trim()
 
-    employees.push({ name, empNo, days, presentDays: present.length, absentDays: absent.length, totalLate, totalOT })
+    const days = []
+    for (let r = dStart; r < data.length; r++) {
+      const row = data[r]
+      const dateCell = String(row[blockCol] || '').trim()
+      if (!dateCell) continue
+      const dayMatch = dateCell.match(/^(\d{1,2})\s+(\w{2})/)
+      if (!dayMatch) continue
+
+      const dayNum   = parseInt(dayMatch[1])
+      const dayOfWeek = dayMatch[2]
+      const isSun    = dayOfWeek === 'Su'
+      const isSat    = dayOfWeek === 'Sa'
+      if (isSun) continue
+      if (isSat && !s.includeSaturday) continue
+
+      const amIn  = String(row[blockCol + parseInt(s.amInOffset)]  || '').trim()
+      const amOut = String(row[blockCol + parseInt(s.amOutOffset)] || '').trim()
+      const pmIn  = String(row[blockCol + parseInt(s.pmInOffset)]  || '').trim()
+      const pmOut = String(row[blockCol + parseInt(s.pmOutOffset)] || '').trim()
+      const otIn  = String(row[blockCol + parseInt(s.otInOffset)]  || '').trim()
+      const otOut = String(row[blockCol + parseInt(s.otOutOffset)] || '').trim()
+
+      const isAbsent = pmIn.toLowerCase().includes('absence') ||
+                       (!amIn && !amOut && !pmIn && !pmOut && !otIn && !otOut)
+
+      let date = null
+      if (startDate) {
+        date = new Date(startDate)
+        date.setDate(startDate.getDate() + dayNum - 1)
+      }
+
+      days.push({ dayNum, dayOfWeek, date, amIn, amOut, pmIn, pmOut, otIn, otOut, isAbsent })
+    }
+
+    employees.push({ name: nameVal, id: idVal, period, startDate, days })
+    blockCol += bw
+    if (employees.length >= 100) break
   }
+
+  if (employees.length === 0) throw new Error('Tidak ada data karyawan ditemukan. Periksa pengaturan kolom.')
+  return employees
+}
+
+/* ═══════════════════════════════════════════════════
+   PASTE PARSERS
+═══════════════════════════════════════════════════ */
+
+// Convert TSV/clipboard text → 2D array
+function tsvTo2D(text) {
+  return text.split('\n').map(row =>
+    row.split('\t').map(c => c.trim().replace(/\r/g, ''))
+  )
+}
+
+// Detect format: 'block' (Sheet 5 layout) or 'raw' (punch rows)
+function detectFormat(data) {
+  // Block layout: wide table, first col has day patterns like "01 Mo", "02 Tu"
+  const dayPattern = /^\d{1,2}\s+(Su|Mo|Tu|We|Th|Fr|Sa)$/
+  let dayMatches = 0, maxCols = 0
+  for (const row of data) {
+    if (row.length > maxCols) maxCols = row.length
+    if (dayPattern.test(row[0])) dayMatches++
+  }
+  if (dayMatches >= 3 && maxCols >= 10) return 'block'
+
+  // Raw punches: narrow table with time values (HH:MM)
+  const timePattern = /^\d{2}:\d{2}(:\d{2})?$/
+  let timeMatches = 0
+  for (const row of data.slice(1, 20)) {
+    for (const cell of row) {
+      if (timePattern.test(cell)) { timeMatches++; break }
+    }
+  }
+  if (timeMatches >= 3) return 'raw'
+
+  return 'block' // default fallback
+}
+
+// Parse block layout 2D array (same logic as parseFile but from array)
+function parseBlockData(data, s) {
+  let period = '', startDate = null
+  for (const row of data.slice(0, 8)) {
+    for (const cell of row) {
+      if (typeof cell === 'string' && cell.includes('~')) {
+        period = cell.trim()
+        const m = period.match(/(\d{4})\/(\d{2})\/(\d{2})/)
+        if (m) startDate = new Date(+m[1], +m[2]-1, +m[3])
+        break
+      }
+    }
+    if (period) break
+  }
+
+  const bw     = parseInt(s.blockWidth)
+  const nRow   = parseInt(s.nameRow)
+  const nOff   = parseInt(s.nameOffset)
+  const idRow  = parseInt(s.idRow)
+  const idOff  = parseInt(s.idOffset)
+  const dStart = parseInt(s.dataStartRow)
+
+  const employees = []
+  let blockCol = 0, attempts = 0
+
+  while (attempts < 60) {
+    attempts++
+    const nameVal = String(data[nRow]?.[blockCol + nOff] || '').trim()
+    if (!nameVal || nameVal === 'Name' || nameVal === 'Dept.') {
+      blockCol += bw
+      if (blockCol > (data[nRow]?.length || 0) + bw) break
+      continue
+    }
+
+    const idVal = String(data[idRow]?.[blockCol + idOff] || '').trim()
+    const days  = []
+
+    for (let r = dStart; r < data.length; r++) {
+      const row      = data[r]
+      const dateCell = String(row[blockCol] || '').trim()
+      if (!dateCell) continue
+      const dayMatch = dateCell.match(/^(\d{1,2})\s+(\w{2})/)
+      if (!dayMatch) continue
+
+      const dayNum    = parseInt(dayMatch[1])
+      const dayOfWeek = dayMatch[2]
+      if (dayOfWeek === 'Su') continue
+      if (dayOfWeek === 'Sa' && !s.includeSaturday) continue
+
+      const get = (off) => String(row[blockCol + parseInt(off)] || '').trim()
+      const amIn = get(s.amInOffset), amOut = get(s.amOutOffset)
+      const pmIn = get(s.pmInOffset), pmOut = get(s.pmOutOffset)
+      const otIn = get(s.otInOffset), otOut = get(s.otOutOffset)
+
+      const isAbsent = pmIn.toLowerCase().includes('absence') ||
+                       (!amIn && !amOut && !pmIn && !pmOut && !otIn && !otOut)
+
+      let date = null
+      if (startDate) {
+        date = new Date(startDate)
+        date.setDate(startDate.getDate() + dayNum - 1)
+      }
+      days.push({ dayNum, dayOfWeek, date, amIn, amOut, pmIn, pmOut, otIn, otOut, isAbsent })
+    }
+
+    employees.push({ name: nameVal, id: idVal, period, startDate, days })
+    blockCol += bw
+    if (employees.length >= 100) break
+  }
+
+  if (employees.length === 0) throw new Error('Format blok tidak terdeteksi. Coba format raw punch atau sesuaikan pengaturan kolom.')
+  return employees
+}
+
+// Parse raw punch rows: each row = one punch event
+// Handles: No | DevId | UserId | UName | Verify | DateTime
+//       OR: No | Name  | Date   | Time
+//       OR: any reasonable variation
+function parseRawData(data) {
+  // Find header row — flexible: matches Name/UName, DateTime/Date+Time
+  let headerIdx = -1, cols = {}
+  const heuristics = {
+    id:       /^(no\.?|id|no)$/i,
+    name:     /^(name|uname|u\.?name|nama)$/i,
+    date:     /^(date|tanggal)$/i,
+    time:     /^(time|jam)$/i,
+    datetime: /^(date\s*[-\/]?\s*time|datetime|tanggal\s*jam)$/i,
+  }
+  for (let r = 0; r < Math.min(10, data.length); r++) {
+    const row = data[r].map(c => String(c).toLowerCase().trim())
+    const found = {}
+    row.forEach((cell, i) => {
+      if (heuristics.id.test(cell))       found.id       = i
+      if (heuristics.name.test(cell))     found.name     = i
+      if (heuristics.date.test(cell))     found.date     = i
+      if (heuristics.time.test(cell))     found.time     = i
+      if (heuristics.datetime.test(cell)) found.datetime = i
+    })
+    // Need at least a name column AND some time info
+    const hasTime = found.time !== undefined || found.datetime !== undefined
+    // Also accept if a column value looks like a datetime (fallback)
+    if (found.name !== undefined && hasTime) {
+      headerIdx = r; cols = found; break
+    }
+  }
+
+  // If still not found, scan data rows for datetime pattern and name-like column
+  if (headerIdx === -1) {
+    const dtRE = /\d{4}[\/\-]\d{2}[\/\-]\d{2}\s+\d{2}:\d{2}/
+    for (let r = 0; r < Math.min(10, data.length); r++) {
+      const row = data[r]
+      const dtCol = row.findIndex(c => dtRE.test(String(c)))
+      if (dtCol > 0) {
+        // Name is likely the column before datetime that has letters
+        let nameCol = dtCol - 1
+        for (let c = dtCol - 1; c >= 0; c--) {
+          if (/[a-zA-Z]{2,}/.test(String(row[c]))) { nameCol = c; break }
+        }
+        cols = { name: nameCol, datetime: dtCol }
+        headerIdx = r - 1 // treat this row as first data row
+        break
+      }
+    }
+    if (headerIdx === -1) {
+      // Last resort: assume No(0) Name(1) Date(2) Time(3)
+      cols = { id: 0, name: 1, date: 2, time: 3 }
+      headerIdx = 0
+    }
+  }
+
+  const timeRE = /(\d{2}:\d{2})/
+  const dtFullRE = /(\d{4}[\/\-]\d{2}[\/\-]\d{2})\s+(\d{2}:\d{2})/
+
+  // Collect all punches
+  const punchMap = {} // name → { dateKey → [times] }
+  let minDate = null, maxDate = null
+
+  for (let r = headerIdx + 1; r < data.length; r++) {
+    const row  = data[r]
+    const name = String(row[cols.name] || '').trim().replace(/\s+/g, ' ')
+    if (!name || name.toLowerCase() === 'name' || name.toLowerCase() === 'uname') continue
+
+    let dateStr = '', timeStr = ''
+
+    if (cols.datetime !== undefined) {
+      const dt = String(row[cols.datetime] || '')
+      // Try full datetime pattern first: 2026/03/15  00:29:19
+      const fullMatch = dt.match(dtFullRE)
+      if (fullMatch) {
+        dateStr = fullMatch[1]
+        timeStr = fullMatch[2]
+      } else {
+        const tm = dt.match(timeRE)
+        timeStr = tm ? tm[1] : ''
+        dateStr = dt.split(/\s+/)[0] || ''
+      }
+    } else {
+      dateStr = String(row[cols.date] || '').trim()
+      // Time col might also have seconds: 07:42:15 → take HH:MM
+      const tm = String(row[cols.time] || '').match(timeRE)
+      timeStr = tm ? tm[1] : ''
+    }
+
+    if (!timeStr || !dateStr) continue
+
+    // Normalize date key: replace / with - for consistent keys
+    const dateKey = dateStr.replace(/\//g, '-')
+    const dateObj = new Date(dateKey)
+    if (isNaN(dateObj.getTime())) continue
+    if (!minDate || dateObj < minDate) minDate = dateObj
+    if (!maxDate || dateObj > maxDate) maxDate = dateObj
+
+    if (!punchMap[name]) punchMap[name] = {}
+    if (!punchMap[name][dateKey]) punchMap[name][dateKey] = []
+    punchMap[name][dateKey].push(timeStr)
+  }
+
+  if (Object.keys(punchMap).length === 0) throw new Error('Tidak ada data absen ditemukan. Pastikan kolom Name dan Time tersedia.')
+
+  const periodStr = minDate && maxDate
+    ? `${minDate.toLocaleDateString('id-ID')} ~ ${maxDate.toLocaleDateString('id-ID')}`
+    : ''
+
+  const employees = Object.entries(punchMap).map(([name, dateMap]) => {
+    const days = Object.entries(dateMap).map(([dateStr, punches]) => {
+      const sorted = [...punches].sort()
+      const date   = new Date(dateStr)
+      const dow    = ['Su','Mo','Tu','We','Th','Fr','Sa'][date.getDay()]
+      return {
+        dayNum:    date.getDate(),
+        dayOfWeek: dow,
+        date,
+        amIn:  sorted[0] || '',
+        amOut: sorted.length >= 4 ? sorted[1] : '',
+        pmIn:  sorted.length >= 4 ? sorted[2] : (sorted.length === 3 ? sorted[1] : ''),
+        pmOut: sorted.length >= 4 ? sorted[3] : (sorted.length === 3 ? sorted[2] : sorted[1] || ''),
+        otIn:  sorted.length >= 6 ? sorted[4] : '',
+        otOut: sorted.length >= 6 ? sorted[5] : '',
+        isAbsent: false,
+      }
+    }).sort((a, b) => a.date - b.date)
+
+    return { name, id: '', period: periodStr, startDate: minDate, days }
+  })
 
   return employees
 }
 
-// ============================================================
-// ESC/POS BUILDER
-// ============================================================
-
-function buildEscPos(emp, period, cfg) {
-  const ESC = 0x1B, GS = 0x1D, LF = 0x0A
-  const b = []
-  const push = (...args) => b.push(...args)
-  const text = s => { for (const c of String(s)) push(c.charCodeAt(0) & 0xFF) }
-  const line = (s = '') => { text(s); push(LF) }
-  const div  = () => line('--------------------------------')
-  const align = a => push(ESC, 0x61, a)   // 0=L 1=C
-  const bold  = on => push(ESC, 0x45, on ? 1 : 0)
-  const size  = big => push(ESC, 0x21, big ? 0x10 : 0x00)
-  const isBig = cfg.printFontSize === 'large'
-
-  push(ESC, 0x40) // init
-
-  align(1); size(true); bold(true)
-  line('LAPORAN ABSENSI')
-  bold(false); size(false)
-  line(period)
-  align(0); div()
-
-  bold(true); line(`Nama   : ${emp.name}`); bold(false)
-  div()
-
-  size(isBig)
-  line('TGL    IN    OUT   TMBT  LMBR')
-  div()
-
-  for (const d of emp.days) {
-    if (d.isWeekend) continue
-    const dt  = d.dateStr.substring(0, 5).padEnd(6)
-    const inp = (d.amIn || (d.isAbsent ? 'ABSEN' : '-')).padEnd(5)
-    const out = (d.lastOut !== null ? minsToTimeStr(d.lastOut) : '-').padEnd(5)
-    const lat = d.isAbsent ? ''.padEnd(5) : (d.lateMin > 0 ? `${d.lateMin}m` : '-').padEnd(5)
-    const ot  = d.otMin > 0 ? minsToHHMM(d.otMin) : '-'
-    line(`${dt}${inp}${out}${lat}${ot}`)
-  }
-
-  size(false); div()
-  line(`Hadir        : ${emp.presentDays} hari`)
-  line(`Absen        : ${emp.absentDays} hari`)
-  line(`Tot.Terlambat: ${emp.totalLate} menit`)
-  line(`Tot.Lembur   : ${minsToHHMM(emp.totalOT)}`)
-  div()
-
-  align(1)
-  const now = new Date()
-  line(`Dicetak: ${now.toLocaleDateString('id-ID')} ${now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}`)
-  align(0)
-
-  push(LF, LF, LF)
-  push(GS, 0x56, 0x41, 0x03) // full cut
-
-  return new Uint8Array(b)
+// Main paste entry point — auto-detects format
+function parsePaste(text, settings) {
+  const data = tsvTo2D(text.trim())
+  if (data.length < 3) throw new Error('Data terlalu sedikit. Pastikan sudah menyalin seluruh tabel.')
+  const format = detectFormat(data)
+  if (format === 'block') return { employees: parseBlockData(data, settings), format: 'block' }
+  return { employees: parseRawData(data), format: 'raw' }
 }
 
-// ============================================================
-// BLUETOOTH PRINT
-// ============================================================
+/* ═══════════════════════════════════════════════════
+   STATS CALCULATOR
+═══════════════════════════════════════════════════ */
 
-const BLE_SERVICES = [
-  '000018f0-0000-1000-8000-00805f9b34fb',
-  '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
-  '0000ff00-0000-1000-8000-00805f9b34fb',
-]
-const BLE_CHARS = [
-  '00002af1-0000-1000-8000-00805f9b34fb',
-  '6e400002-b5a3-f393-e0a9-e50e24dcca9e',
-  '0000ff02-0000-1000-8000-00805f9b34fb',
-]
+function calcStats(employee, s) {
+  const schedStart = timeToMins(s.scheduleStart) + parseInt(s.graceMinutes)
+  const schedEnd   = timeToMins(s.scheduleEnd)
+  let totalPresent = 0, totalAbsent = 0, totalLate = 0, totalOT = 0
 
-async function bluetoothPrint(emp, period, cfg) {
-  if (!navigator.bluetooth) throw new Error('WebBluetooth tidak tersedia. Gunakan Android Chrome.')
-  const bytes = buildEscPos(emp, period, cfg)
-  const device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: BLE_SERVICES })
-  const server = await device.gatt.connect()
-
-  let char = null
-  for (let i = 0; i < BLE_SERVICES.length; i++) {
-    try {
-      const svc = await server.getPrimaryService(BLE_SERVICES[i])
-      char = await svc.getCharacteristic(BLE_CHARS[i])
-      break
-    } catch {}
-  }
-  if (!char) throw new Error('Characteristic printer tidak ditemukan. Coba printer lain.')
-
-  for (let i = 0; i < bytes.length; i += 20) {
-    await char.writeValue(bytes.slice(i, i + 20))
-  }
-  await device.gatt.disconnect()
-}
-
-// ============================================================
-// APP ROOT
-// ============================================================
-
-export default function App() {
-  const [page, setPage]           = useState(PAGES.UPLOAD)
-  const [settings, setSettings]   = useState(loadSettings)
-  const [employees, setEmployees] = useState([])
-  const [period, setPeriod]       = useState('')
-  const [selected, setSelected]   = useState(null)
-  const [printMsg, setPrintMsg]   = useState({ text: '', ok: true })
-  const [globalErr, setGlobalErr] = useState('')
-
-  const applySettings = s => { setSettings(s); saveSettingsStorage(s) }
-
-  const handleFile = useCallback(async file => {
-    setGlobalErr('')
-    try {
-      const buf = await file.arrayBuffer()
-      const wb = XLSX.read(buf, { type: 'array' })
-      const sheet = wb.Sheets[wb.SheetNames[settings.sheetIndex]]
-      const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
-      // Try grab period string from row 1 or 3
-      const periodStr = String(raw[1]?.[3] || raw[3]?.[1] || '').trim()
-      setPeriod(periodStr)
-      const emps = parseFile(wb, settings)
-      if (!emps.length) throw new Error('Tidak ada data karyawan ditemukan. Periksa "Index Sheet" dan "Row Nama" di Pengaturan.')
-      setEmployees(emps)
-      setPage(PAGES.LIST)
-    } catch (e) {
-      setGlobalErr(e.message)
+  const dailyData = employee.days.map(day => {
+    if (day.isAbsent) {
+      totalAbsent++
+      return { ...day, lateMinutes: 0, otMinutes: 0, firstIn: null, lastOut: null }
     }
-  }, [settings])
 
-  const handlePrint = async emp => {
-    setPrintMsg({ text: 'Menghubungkan...', ok: true })
-    try {
-      await bluetoothPrint(emp, period, settings)
-      setPrintMsg({ text: '✓ Berhasil dicetak!', ok: true })
-    } catch (e) {
-      setPrintMsg({ text: `✗ ${e.message}`, ok: false })
+    const firstIn  = day.amIn || null
+    const lastOut  = day.otOut || day.pmOut || day.amOut || null
+
+    if (!firstIn && !lastOut) {
+      totalAbsent++
+      return { ...day, lateMinutes: 0, otMinutes: 0, firstIn: null, lastOut: null }
     }
-    setTimeout(() => setPrintMsg({ text: '', ok: true }), 5000)
+
+    totalPresent++
+
+    const inMins  = timeToMins(firstIn)
+    const outMins = timeToMins(lastOut)
+    const late    = inMins  !== null ? Math.max(0, inMins  - schedStart) : 0
+    const ot      = outMins !== null ? Math.max(0, outMins - schedEnd)   : 0
+
+    totalLate += late
+    totalOT   += ot
+
+    return { ...day, lateMinutes: late, otMinutes: ot, firstIn, lastOut }
+  })
+
+  return { dailyData, totalPresent, totalAbsent, totalLate, totalOT }
+}
+
+/* ═══════════════════════════════════════════════════
+   ESC/POS BUILDER
+═══════════════════════════════════════════════════ */
+
+function buildEscPos(employee, stats, settings) {
+  const bytes = []
+  const push  = (...b) => bytes.push(...b)
+  const text  = (str) => {
+    for (const ch of String(str)) {
+      const c = ch.charCodeAt(0)
+      bytes.push(c < 128 ? c : 0x3F)
+    }
+  }
+  const line    = (str = '') => { text(str); push(0x0A) }
+  const center  = ()         => push(0x1B, 0x61, 0x01)
+  const left    = ()         => push(0x1B, 0x61, 0x00)
+  const bold    = (on)       => push(0x1B, 0x45, on ? 1 : 0)
+  const bigFont = (on)       => push(0x1D, 0x21, on ? 0x01 : 0x00) // double height only
+
+  push(0x1B, 0x40) // init
+
+  const large = settings.printFontSize === 'large'
+  const W     = large ? 32 : 32 // 58mm = ~32 chars normal
+
+  bigFont(large)
+  center(); bold(true)
+  line('================================')
+  line(employee.name.toUpperCase())
+  bold(false)
+  line(`Periode: ${employee.period}`)
+  line('--------------------------------')
+
+  left()
+  if (!large) {
+    text('TGL   '); text('IN    '); text('OUT   '); text('LATE  '); line('OT')
+    line('--------------------------------')
   }
 
-  return (
-    <div style={S.app}>
-      <Navbar page={page} setPage={setPage} hasData={!!employees.length} />
-      {globalErr && (
-        <div style={S.toast}>
-          <span>{globalErr}</span>
-          <button onClick={() => setGlobalErr('')} style={S.toastClose}>×</button>
-        </div>
-      )}
-      {page === PAGES.UPLOAD   && <UploadPage onFile={handleFile} />}
-      {page === PAGES.LIST     && <ListPage employees={employees} period={period} onSelect={e => { setSelected(e); setPage(PAGES.DETAIL) }} />}
-      {page === PAGES.DETAIL   && selected && <DetailPage emp={selected} onPrint={handlePrint} printMsg={printMsg} />}
-      {page === PAGES.SETTINGS && <SettingsPage settings={settings} onSave={applySettings} />}
-    </div>
-  )
+  stats.dailyData.forEach(day => {
+    const d = formatDate(day.date) || `${String(day.dayNum).padStart(2,'0')}/${day.dayOfWeek}`
+    if (!day.firstIn && !day.lastOut) {
+      const pad = large ? '  ' : '      '
+      line(`${d}${pad}ABSEN`)
+    } else {
+      const inT  = (day.firstIn  || '-').padEnd(6)
+      const outT = (day.lastOut  || '-').padEnd(6)
+      const late = (day.lateMinutes > 0 ? `${day.lateMinutes}m` : '0').padEnd(6)
+      const ot   = minsToDisplay(day.otMinutes)
+      if (large) {
+        line(`${d} ${inT}${outT}`)
+        line(`     L:${(day.lateMinutes > 0 ? day.lateMinutes+'m' : '0').padEnd(5)} OT:${ot}`)
+      } else {
+        line(`${d} ${inT}${outT}${late}${ot}`)
+      }
+    }
+  })
+
+  line('--------------------------------')
+  line(`Hadir        : ${stats.totalPresent} hari`)
+  line(`Absen        : ${stats.totalAbsent} hari`)
+  line(`Tot.Terlambat: ${stats.totalLate} menit`)
+  line(`Tot.Lembur   : ${minsToDisplay(stats.totalOT)}`)
+  center()
+  line('================================')
+  line(new Date().toLocaleDateString('id-ID', { day:'2-digit', month:'2-digit', year:'numeric' }))
+
+  push(0x1B, 0x64, 0x05) // feed 5 lines
+  return new Uint8Array(bytes)
 }
 
-// ============================================================
-// NAVBAR
-// ============================================================
+/* ═══════════════════════════════════════════════════
+   BLUETOOTH PRINT
+═══════════════════════════════════════════════════ */
 
-function Navbar({ page, setPage, hasData }) {
-  return (
-    <nav style={S.nav}>
-      <div style={S.navBrand}>
-        <span style={S.navIcon}>◉</span>
-        <span>AbsensiPrint</span>
-      </div>
-      <div style={S.navLinks}>
-        <NBtn active={page === PAGES.UPLOAD}   onClick={() => setPage(PAGES.UPLOAD)}>Upload</NBtn>
-        {hasData && <NBtn active={page === PAGES.LIST} onClick={() => setPage(PAGES.LIST)}>Karyawan</NBtn>}
-        <NBtn active={page === PAGES.SETTINGS} onClick={() => setPage(PAGES.SETTINGS)}>Pengaturan</NBtn>
-      </div>
-    </nav>
-  )
-}
+async function printBluetooth(data, settings) {
+  if (!navigator.bluetooth) throw new Error('WebBluetooth tidak didukung. Gunakan Chrome di Android.')
+  const svcUUID = settings.btServiceUUID.toLowerCase()
+  const chrUUID = settings.btCharUUID.toLowerCase()
 
-function NBtn({ active, onClick, children }) {
-  return (
-    <button onClick={onClick} style={{ ...S.navBtn, ...(active ? S.navBtnOn : {}) }}>
-      {children}
-    </button>
-  )
-}
+  const device = await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: [svcUUID],
+  })
+  const server  = await device.gatt.connect()
+  const service = await server.getPrimaryService(svcUUID)
+  const char    = await service.getCharacteristic(chrUUID)
 
-// ============================================================
-// UPLOAD PAGE
-// ============================================================
-
-function UploadPage({ onFile }) {
-  const [drag, setDrag] = useState(false)
-
-  const onDrop = e => {
-    e.preventDefault(); setDrag(false)
-    if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0])
+  const CHUNK = 512
+  for (let i = 0; i < data.length; i += CHUNK) {
+    try {
+      await char.writeValueWithoutResponse(data.slice(i, i + CHUNK))
+    } catch {
+      await char.writeValue(data.slice(i, i + CHUNK))
+    }
+    await new Promise(r => setTimeout(r, 60))
   }
+  device.gatt.disconnect()
+}
 
+/* ═══════════════════════════════════════════════════
+   STYLES (injected once)
+═══════════════════════════════════════════════════ */
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:     #0b1120;
+  --card:   #131f35;
+  --card2:  #1a2942;
+  --border: #1e3251;
+  --teal:   #2dd4bf;
+  --teal2:  #0d9488;
+  --amber:  #f59e0b;
+  --red:    #f43f5e;
+  --muted:  #64748b;
+  --text:   #e2e8f0;
+  --text2:  #94a3b8;
+  --mono:   'IBM Plex Mono', monospace;
+  --sans:   'IBM Plex Sans', sans-serif;
+}
+
+body { background: var(--bg); color: var(--text); font-family: var(--sans); }
+
+#app-root {
+  max-width: 480px;
+  margin: 0 auto;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ── */
+.app-header {
+  padding: 14px 16px 10px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.app-header .logo {
+  width: 32px; height: 32px;
+  background: var(--teal);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px;
+}
+.app-header h1 { font-size: 15px; font-weight: 700; letter-spacing: .02em; }
+.app-header p  { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 1px; }
+
+/* ── Scrollable body ── */
+.app-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  padding-bottom: 80px;
+}
+
+/* ── Bottom nav ── */
+.bottom-nav {
+  position: fixed;
+  bottom: 0; left: 50%; transform: translateX(-50%);
+  width: 100%; max-width: 480px;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  display: flex;
+  z-index: 100;
+}
+.nav-btn {
+  flex: 1;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 3px;
+  padding: 10px 0 12px;
+  background: none; border: none; color: var(--muted);
+  font-family: var(--sans); font-size: 10px; font-weight: 500;
+  cursor: pointer; transition: color .15s;
+}
+.nav-btn.active { color: var(--teal); }
+.nav-btn svg { width: 20px; height: 20px; }
+
+/* ── Cards ── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+.card-title {
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .08em;
+  color: var(--muted); margin-bottom: 12px;
+}
+
+/* ── Upload zone ── */
+.upload-zone {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 32px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+}
+.upload-zone:hover, .upload-zone.drag { border-color: var(--teal); background: rgba(45,212,191,.05); }
+.upload-zone .icon { font-size: 32px; margin-bottom: 8px; }
+.upload-zone h3 { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+.upload-zone p  { font-size: 12px; color: var(--muted); }
+.upload-zone input { display: none; }
+
+/* ── Buttons ── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 10px 18px; border-radius: 8px; font-family: var(--sans);
+  font-size: 13px; font-weight: 600; cursor: pointer; border: none;
+  transition: opacity .15s, transform .1s;
+}
+.btn:active { transform: scale(.97); }
+.btn:disabled { opacity: .4; cursor: not-allowed; }
+.btn-primary { background: var(--teal); color: #0b1120; }
+.btn-primary:hover:not(:disabled) { background: #5eead4; }
+.btn-secondary { background: var(--card2); color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover:not(:disabled) { background: #223154; }
+.btn-danger { background: rgba(244,63,94,.15); color: var(--red); border: 1px solid rgba(244,63,94,.3); }
+.btn-sm { padding: 7px 12px; font-size: 12px; }
+.btn-full { width: 100%; }
+
+/* ── Employee list ── */
+.emp-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 10px; margin-bottom: 8px;
+  cursor: pointer; transition: border-color .15s;
+}
+.emp-item:hover { border-color: var(--teal); }
+.emp-avatar {
+  width: 40px; height: 40px; border-radius: 10px;
+  background: linear-gradient(135deg, var(--teal2), #0d7490);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px; font-weight: 700; color: white; flex-shrink: 0;
+}
+.emp-info { flex: 1; min-width: 0; }
+.emp-name { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.emp-meta { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
+.emp-arrow { color: var(--muted); }
+
+/* ── Stats chips ── */
+.stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+.stats-row.four { grid-template-columns: 1fr 1fr 1fr 1fr; }
+.stat-chip {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; text-align: center;
+}
+.stat-chip .val { font-size: 18px; font-weight: 700; font-family: var(--mono); color: var(--teal); }
+.stat-chip .lbl { font-size: 10px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; }
+.stat-chip.red  .val { color: var(--red); }
+.stat-chip.amber .val { color: var(--amber); }
+
+/* ── Day table ── */
+.day-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+.day-table th {
+  text-align: left; padding: 6px 8px;
+  font-size: 10px; color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  text-transform: uppercase; letter-spacing: .06em;
+}
+.day-table td { padding: 7px 8px; border-bottom: 1px solid rgba(30,50,81,.6); }
+.day-table tr:last-child td { border-bottom: none; }
+.day-table .absent td { color: var(--muted); font-style: italic; }
+.badge {
+  display: inline-block; padding: 2px 6px; border-radius: 4px;
+  font-size: 10px; font-weight: 600; font-family: var(--sans);
+}
+.badge-red    { background: rgba(244,63,94,.15);  color: var(--red); }
+.badge-amber  { background: rgba(245,158,11,.15); color: var(--amber); }
+.badge-teal   { background: rgba(45,212,191,.15); color: var(--teal); }
+.badge-muted  { background: rgba(100,116,139,.15); color: var(--muted); }
+
+/* ── Settings ── */
+.field { margin-bottom: 14px; }
+.field label {
+  display: block; font-size: 11px; font-weight: 600;
+  color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+  margin-bottom: 6px;
+}
+.field input, .field select {
+  width: 100%; padding: 10px 12px;
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-family: var(--mono);
+  font-size: 13px; outline: none; transition: border-color .15s;
+}
+.field input:focus, .field select:focus { border-color: var(--teal); }
+.field input[type=number] { appearance: textfield; }
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px;
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 8px; margin-bottom: 14px;
+}
+.toggle-row span { font-size: 13px; }
+.toggle {
+  width: 40px; height: 22px; border-radius: 11px;
+  background: var(--border); border: none; cursor: pointer;
+  position: relative; transition: background .2s;
+}
+.toggle.on { background: var(--teal2); }
+.toggle::after {
+  content: ''; position: absolute;
+  top: 3px; left: 3px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: white; transition: left .2s;
+}
+.toggle.on::after { left: 21px; }
+.field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.section-divider {
+  font-size: 11px; font-weight: 700; color: var(--teal);
+  text-transform: uppercase; letter-spacing: .1em;
+  padding: 6px 0 10px; border-bottom: 1px solid var(--border); margin-bottom: 14px;
+}
+.advanced-toggle {
+  width: 100%; background: none; border: 1px dashed var(--border);
+  border-radius: 8px; padding: 10px; color: var(--muted);
+  font-family: var(--sans); font-size: 12px; cursor: pointer;
+  margin-bottom: 14px; transition: color .15s;
+}
+.advanced-toggle:hover { color: var(--text); }
+
+/* ── Toast / Alert ── */
+.toast {
+  padding: 12px 16px; border-radius: 10px; margin-bottom: 12px;
+  font-size: 13px; display: flex; align-items: flex-start; gap: 8px;
+}
+.toast-error   { background: rgba(244,63,94,.12);  border: 1px solid rgba(244,63,94,.3);  color: #fb7185; }
+.toast-success { background: rgba(45,212,191,.12); border: 1px solid rgba(45,212,191,.3); color: var(--teal); }
+.toast-info    { background: rgba(100,116,139,.12); border: 1px solid rgba(100,116,139,.3); color: var(--text2); }
+
+/* ── Back button ── */
+.back-btn {
+  display: flex; align-items: center; gap: 6px;
+  background: none; border: none; color: var(--teal);
+  font-family: var(--sans); font-size: 13px; font-weight: 600;
+  cursor: pointer; padding: 0; margin-bottom: 16px;
+}
+
+/* ── Mode toggle (File / Paste) ── */
+.mode-toggle {
+  display: flex;
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 4px; gap: 4px; margin-bottom: 14px;
+}
+.mode-btn {
+  flex: 1; padding: 8px; border-radius: 7px; border: none;
+  background: none; color: var(--muted); font-family: var(--sans);
+  font-size: 13px; font-weight: 600; cursor: pointer; transition: all .15s;
+}
+.mode-btn.active { background: var(--card); color: var(--teal); box-shadow: 0 1px 4px rgba(0,0,0,.3); }
+
+/* ── Paste area ── */
+.paste-area {
+  width: 100%; min-height: 160px;
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px;
+  color: var(--text); font-family: var(--mono); font-size: 11px;
+  line-height: 1.6; resize: vertical; outline: none;
+  transition: border-color .15s;
+}
+.paste-area:focus { border-color: var(--teal); }
+.paste-area::placeholder { color: var(--muted); }
+.format-badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600;
+  margin-bottom: 8px;
+}
+
+/* ── Print preview ── */
+.print-preview {
+  background: #f8f8f8; color: #111;
+  border-radius: 8px; padding: 16px;
+  font-family: var(--mono); font-size: 11px;
+  line-height: 1.7; white-space: pre;
+  overflow-x: auto; margin-bottom: 12px;
+  border: 1px solid var(--border);
+}
+
+/* ── Empty state ── */
+.empty { text-align: center; padding: 48px 16px; }
+.empty .icon { font-size: 40px; margin-bottom: 12px; }
+.empty h3 { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+.empty p  { font-size: 13px; color: var(--muted); line-height: 1.5; }
+
+/* ── File info pill ── */
+.file-pill {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; background: rgba(45,212,191,.08);
+  border: 1px solid rgba(45,212,191,.2); border-radius: 10px; margin-bottom: 12px;
+}
+.file-pill .name { font-size: 13px; font-weight: 600; flex: 1; }
+.file-pill .meta { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+
+/* ── Search ── */
+.search-input {
+  width: 100%; padding: 10px 12px 10px 36px;
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); font-family: var(--sans);
+  font-size: 13px; outline: none; transition: border-color .15s;
+  margin-bottom: 12px;
+}
+.search-input:focus { border-color: var(--teal); }
+.search-wrap { position: relative; }
+.search-wrap .search-icon {
+  position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+  color: var(--muted); pointer-events: none;
+}
+`
+
+/* ═══════════════════════════════════════════════════
+   COMPONENTS
+═══════════════════════════════════════════════════ */
+
+function Toast({ type, msg }) {
+  if (!msg) return null
+  const icons = { error: '⚠️', success: '✅', info: 'ℹ️' }
   return (
-    <div style={S.page}>
-      <div style={S.pageHead}>
-        <h1 style={S.h1}>Upload File Absensi</h1>
-        <p style={S.sub}>Export dari mesin fingerprint (.xls / .xlsx)</p>
-      </div>
-      <div
-        style={{ ...S.drop, ...(drag ? S.dropActive : {}) }}
-        onDragOver={e => { e.preventDefault(); setDrag(true) }}
-        onDragLeave={() => setDrag(false)}
-        onDrop={onDrop}
-        onClick={() => document.getElementById('fi').click()}
-      >
-        <div style={S.dropEmoji}>📂</div>
-        <div style={S.dropLabel}>Drag & drop file atau klik untuk pilih</div>
-        <div style={S.dropHint}>.xls · .xlsx</div>
-        <input id="fi" type="file" accept=".xls,.xlsx" style={{ display: 'none' }}
-          onChange={e => e.target.files[0] && onFile(e.target.files[0])} />
-      </div>
-      <div style={S.btNote}>
-        <span style={S.btDot}>⚠</span>
-        Print via Bluetooth hanya berfungsi di <strong>Android Chrome</strong>
-      </div>
+    <div className={`toast toast-${type}`}>
+      <span>{icons[type]}</span>
+      <span>{msg}</span>
     </div>
   )
 }
 
-// ============================================================
-// LIST PAGE
-// ============================================================
-
-function ListPage({ employees, period, onSelect }) {
-  const [q, setQ] = useState('')
-  const filtered = employees.filter(e => e.name.toLowerCase().includes(q.toLowerCase()))
-
-  return (
-    <div style={S.page}>
-      <div style={S.pageHead}>
-        <h1 style={S.h1}>Daftar Karyawan</h1>
-        <p style={S.sub}>{period} — {employees.length} karyawan</p>
-      </div>
-      <input
-        style={S.search}
-        placeholder="🔍  Cari nama..."
-        value={q}
-        onChange={e => setQ(e.target.value)}
-      />
-      <div style={S.grid}>
-        {filtered.map((emp, i) => (
-          <EmpCard key={i} emp={emp} onClick={() => onSelect(emp)} />
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function EmpCard({ emp, onClick }) {
-  return (
-    <div style={S.card} onClick={onClick}>
-      <div style={S.cardName}>{emp.name}</div>
-      <div style={S.cardStats}>
-        <Chip label="Hadir"  val={`${emp.presentDays}h`} color="#4ade80" />
-        <Chip label="Absen"  val={`${emp.absentDays}h`}  color="#f87171" />
-        <Chip label="Terlambat" val={`${emp.totalLate}m`}  color="#fbbf24" />
-        <Chip label="Lembur" val={minsToHHMM(emp.totalOT)} color="#60a5fa" />
-      </div>
-      <div style={S.cardArrow}>→</div>
-    </div>
-  )
-}
-
-function Chip({ label, val, color }) {
-  return (
-    <div style={S.chip}>
-      <span style={{ ...S.chipVal, color }}>{val}</span>
-      <span style={S.chipLabel}>{label}</span>
-    </div>
-  )
-}
-
-// ============================================================
-// DETAIL PAGE
-// ============================================================
-
-function DetailPage({ emp, onPrint, printMsg }) {
-  return (
-    <div style={S.page}>
-      <div style={S.detailTop}>
-        <div>
-          <h1 style={S.h1}>{emp.name}</h1>
-          <div style={S.summaryRow}>
-            <SumCard label="Hari Hadir"    val={emp.presentDays}          color="#4ade80" unit="hari" />
-            <SumCard label="Hari Absen"    val={emp.absentDays}           color="#f87171" unit="hari" />
-            <SumCard label="Tot.Terlambat" val={`${emp.totalLate}`}       color="#fbbf24" unit="menit" />
-            <SumCard label="Tot.Lembur"    val={minsToHHMM(emp.totalOT)}  color="#60a5fa" />
-          </div>
-        </div>
-        <div style={S.printGroup}>
-          <button style={S.printBtn} onClick={() => onPrint(emp)}>🖨 Print</button>
-          {printMsg.text && (
-            <div style={{ ...S.printStatus, color: printMsg.ok ? '#4ade80' : '#f87171' }}>
-              {printMsg.text}
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div style={S.tblWrap}>
-        <table style={S.tbl}>
-          <thead>
-            <tr>
-              {['Tgl', 'AM In', 'AM Out', 'PM In', 'PM Out', 'OT In', 'OT Out', 'Terlambat', 'Lembur'].map(h => (
-                <th key={h} style={S.th}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {emp.days.filter(d => !d.isWeekend).map((d, i) => (
-              <tr key={i} style={{ ...S.tr, ...(d.isAbsent ? S.trAbs : i % 2 === 0 ? S.trAlt : {}) }}>
-                <td style={{ ...S.td, ...S.tdDate }}>{d.dateStr}</td>
-                <td style={S.tdMono}>{d.isAbsent ? <span style={S.absTag}>ABSEN</span> : d.amIn || '-'}</td>
-                <td style={S.tdMono}>{d.amOut || '-'}</td>
-                <td style={S.tdMono}>{d.pmIn || '-'}</td>
-                <td style={S.tdMono}>{d.pmOut || '-'}</td>
-                <td style={S.tdMono}>{d.otIn || '-'}</td>
-                <td style={S.tdMono}>{d.otOut || '-'}</td>
-                <td style={{ ...S.td, color: d.lateMin > 0 ? '#fbbf24' : '#475569', fontWeight: d.lateMin > 0 ? 600 : 400 }}>
-                  {d.lateMin > 0 ? `${d.lateMin} mnt` : '-'}
-                </td>
-                <td style={{ ...S.td, color: d.otMin > 0 ? '#60a5fa' : '#475569', fontWeight: d.otMin > 0 ? 600 : 400 }}>
-                  {d.otMin > 0 ? minsToHHMM(d.otMin) : '-'}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
-}
-
-function SumCard({ label, val, color, unit }) {
-  return (
-    <div style={S.sumCard}>
-      <div style={{ ...S.sumVal, color }}>{val}{unit ? <span style={S.sumUnit}> {unit}</span> : ''}</div>
-      <div style={S.sumLabel}>{label}</div>
-    </div>
-  )
-}
-
-// ============================================================
-// SETTINGS PAGE
-// ============================================================
-
-function SettingsPage({ settings, onSave }) {
-  const [s, setS] = useState({ ...settings })
-  const set = (k, v) => setS(p => ({ ...p, [k]: v }))
+/* ── Settings Tab ── */
+function SettingsTab({ settings, onSave }) {
+  const [s, setS] = useState(settings)
+  const [advanced, setAdvanced] = useState(false)
   const [saved, setSaved] = useState(false)
+
+  const set = (k, v) => setS(p => ({ ...p, [k]: v }))
+
+  const handlePreset = (preset) => {
+    if (preset !== 'custom') {
+      set('btServiceUUID', BT_PRESETS[preset].svc)
+      set('btCharUUID',    BT_PRESETS[preset].chr)
+    }
+    set('btPreset', preset)
+  }
 
   const save = () => {
     onSave(s)
@@ -508,190 +896,770 @@ function SettingsPage({ settings, onSave }) {
   }
 
   return (
-    <div style={S.page}>
-      <div style={S.pageHead}>
-        <h1 style={S.h1}>Pengaturan</h1>
-        <p style={S.sub}>Semua pengaturan tersimpan otomatis di browser</p>
+    <div>
+      {saved && <Toast type="success" msg="Pengaturan disimpan!" />}
+
+      <div className="card">
+        <div className="section-divider">⏰ Jadwal Kerja</div>
+        <div className="field-row">
+          <div className="field">
+            <label>Jam Masuk</label>
+            <input type="time" value={s.scheduleStart} onChange={e => set('scheduleStart', e.target.value)} />
+          </div>
+          <div className="field">
+            <label>Jam Keluar</label>
+            <input type="time" value={s.scheduleEnd} onChange={e => set('scheduleEnd', e.target.value)} />
+          </div>
+        </div>
+        <div className="field">
+          <label>Toleransi Terlambat (menit)</label>
+          <input type="number" min="0" max="60" value={s.graceMinutes} onChange={e => set('graceMinutes', e.target.value)} />
+        </div>
+        <div className="toggle-row">
+          <span>Masuk Sabtu</span>
+          <button className={`toggle ${s.includeSaturday ? 'on' : ''}`} onClick={() => set('includeSaturday', !s.includeSaturday)} />
+        </div>
       </div>
 
-      <Sec title="📅 Jadwal Kerja">
-        <Row label="Jam Masuk">
-          <input type="time" value={s.workStart} onChange={e => set('workStart', e.target.value)} style={S.inp} />
-        </Row>
-        <Row label="Jam Keluar">
-          <input type="time" value={s.workEnd} onChange={e => set('workEnd', e.target.value)} style={S.inp} />
-        </Row>
-        <Row label="Toleransi Terlambat (menit)" hint="Cth: 5 = terlambat dihitung jika masuk setelah jam masuk + 5 menit">
-          <input type="number" min="0" value={s.gracePeriod} onChange={e => set('gracePeriod', e.target.value)} style={{ ...S.inp, maxWidth: 120 }} />
-        </Row>
-        <Row label="Min. Menit untuk Lembur" hint="Menit setelah jam keluar sebelum dihitung lembur (0 = langsung)">
-          <input type="number" min="0" value={s.overtimeMin} onChange={e => set('overtimeMin', e.target.value)} style={{ ...S.inp, maxWidth: 120 }} />
-        </Row>
-        <Row label="Hari Kerja">
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-            {['Min','Sen','Sel','Rab','Kam','Jum','Sab'].map((d, i) => (
-              <button
-                key={i}
-                style={{ ...S.dayBtn, ...(s.workDays.includes(i) ? S.dayBtnOn : {}) }}
-                onClick={() => set('workDays', s.workDays.includes(i) ? s.workDays.filter(x => x !== i) : [...s.workDays, i])}
-              >{d}</button>
-            ))}
-          </div>
-        </Row>
-      </Sec>
-
-      <Sec title="🖨 Cetak / Print">
-        <Row label="Ukuran Font Slip 58mm">
-          <select value={s.printFontSize} onChange={e => set('printFontSize', e.target.value)} style={S.inp}>
-            <option value="normal">Normal — lebih banyak data per baris</option>
-            <option value="large">Besar — header nama lebih besar</option>
+      <div className="card">
+        <div className="section-divider">🖨️ Cetak</div>
+        <div className="field">
+          <label>Ukuran Font</label>
+          <select value={s.printFontSize} onChange={e => set('printFontSize', e.target.value)}>
+            <option value="normal">Normal (32 karakter/baris)</option>
+            <option value="large">Besar (tinggi ganda)</option>
           </select>
-        </Row>
-      </Sec>
+        </div>
+        <div className="field">
+          <label>Model Printer Bluetooth</label>
+          <select value={s.btPreset} onChange={e => handlePreset(e.target.value)}>
+            {Object.entries(BT_PRESETS).map(([k, v]) => (
+              <option key={k} value={k}>{v.label}</option>
+            ))}
+          </select>
+        </div>
+        {s.btPreset === 'custom' && (
+          <>
+            <div className="field">
+              <label>Service UUID</label>
+              <input value={s.btServiceUUID} onChange={e => set('btServiceUUID', e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+            </div>
+            <div className="field">
+              <label>Characteristic UUID</label>
+              <input value={s.btCharUUID} onChange={e => set('btCharUUID', e.target.value)} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+            </div>
+          </>
+        )}
+        {s.btPreset !== 'custom' && (
+          <div className="toast toast-info" style={{ marginBottom: 0 }}>
+            <span>ℹ️</span>
+            <div>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10, marginBottom: 2 }}>SVC: {s.btServiceUUID}</div>
+              <div style={{ fontFamily: 'var(--mono)', fontSize: 10 }}>CHR: {s.btCharUUID}</div>
+            </div>
+          </div>
+        )}
+      </div>
 
-      <Sec title="📂 Mapping File / Sheet" hint="Sesuaikan jika format mesin baru berbeda">
-        <Row label="Index Sheet (mulai dari 0)" hint="Sheet ke-5 = index 4">
-          <input type="number" min="0" value={s.sheetIndex} onChange={e => set('sheetIndex', parseInt(e.target.value))} style={{ ...S.inp, maxWidth: 120 }} />
-        </Row>
-        <Row label="Lebar Blok per Karyawan (kolom)" hint="Default mesin ini: 15">
-          <input type="number" min="1" value={s.blockWidth} onChange={e => set('blockWidth', parseInt(e.target.value))} style={{ ...S.inp, maxWidth: 120 }} />
-        </Row>
-        <Row label="Baris Nama (row index, mulai dari 0)" hint="Default: 2">
-          <input type="number" min="0" value={s.nameRow} onChange={e => set('nameRow', parseInt(e.target.value))} style={{ ...S.inp, maxWidth: 120 }} />
-        </Row>
-        <Row label="Offset Kolom Nama dalam Blok" hint="Default: 9">
-          <input type="number" min="0" value={s.nameColOffset} onChange={e => set('nameColOffset', parseInt(e.target.value))} style={{ ...S.inp, maxWidth: 120 }} />
-        </Row>
-        <Row label="Baris Awal Data Harian (row index, mulai dari 0)" hint="Default: 11">
-          <input type="number" min="0" value={s.dataStartRow} onChange={e => set('dataStartRow', parseInt(e.target.value))} style={{ ...S.inp, maxWidth: 120 }} />
-        </Row>
-      </Sec>
+      <div className="card">
+        <div className="section-divider">🗂️ Mapping Kolom File</div>
+        <button className="advanced-toggle" onClick={() => setAdvanced(!advanced)}>
+          {advanced ? '▲ Sembunyikan' : '▼ Tampilkan'} pengaturan lanjutan (untuk mesin baru)
+        </button>
+        {advanced && (
+          <>
+            <Toast type="info" msg="Ubah ini jika format file dari mesin baru berbeda. Default sudah sesuai untuk mesin saat ini." />
+            <div className="field-row">
+              <div className="field">
+                <label>Nomor Sheet (0=pertama)</label>
+                <input type="number" min="0" value={s.sheetIndex} onChange={e => set('sheetIndex', e.target.value)} />
+              </div>
+              <div className="field">
+                <label>Lebar Blok Karyawan</label>
+                <input type="number" min="1" value={s.blockWidth} onChange={e => set('blockWidth', e.target.value)} />
+              </div>
+            </div>
+            <div className="field-row">
+              <div className="field">
+                <label>Baris Nama (0=pertama)</label>
+                <input type="number" min="0" value={s.nameRow} onChange={e => set('nameRow', e.target.value)} />
+              </div>
+              <div className="field">
+                <label>Offset Kolom Nama</label>
+                <input type="number" min="0" value={s.nameOffset} onChange={e => set('nameOffset', e.target.value)} />
+              </div>
+            </div>
+            <div className="field-row">
+              <div className="field">
+                <label>Baris ID</label>
+                <input type="number" min="0" value={s.idRow} onChange={e => set('idRow', e.target.value)} />
+              </div>
+              <div className="field">
+                <label>Offset Kolom ID</label>
+                <input type="number" min="0" value={s.idOffset} onChange={e => set('idOffset', e.target.value)} />
+              </div>
+            </div>
+            <div className="field">
+              <label>Baris Mulai Data Harian</label>
+              <input type="number" min="0" value={s.dataStartRow} onChange={e => set('dataStartRow', e.target.value)} />
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 10, fontFamily: 'var(--mono)' }}>
+              Offset kolom dalam tiap blok karyawan:
+            </div>
+            <div className="field-row">
+              <div className="field"><label>AM In</label>  <input type="number" min="0" value={s.amInOffset}  onChange={e => set('amInOffset',  e.target.value)} /></div>
+              <div className="field"><label>AM Out</label> <input type="number" min="0" value={s.amOutOffset} onChange={e => set('amOutOffset', e.target.value)} /></div>
+            </div>
+            <div className="field-row">
+              <div className="field"><label>PM In</label>  <input type="number" min="0" value={s.pmInOffset}  onChange={e => set('pmInOffset',  e.target.value)} /></div>
+              <div className="field"><label>PM Out</label> <input type="number" min="0" value={s.pmOutOffset} onChange={e => set('pmOutOffset', e.target.value)} /></div>
+            </div>
+            <div className="field-row">
+              <div className="field"><label>OT In</label>  <input type="number" min="0" value={s.otInOffset}  onChange={e => set('otInOffset',  e.target.value)} /></div>
+              <div className="field"><label>OT Out</label> <input type="number" min="0" value={s.otOutOffset} onChange={e => set('otOutOffset', e.target.value)} /></div>
+            </div>
+          </>
+        )}
+      </div>
 
-      <button style={{ ...S.saveBtn, ...(saved ? S.saveBtnOk : {}) }} onClick={save}>
-        {saved ? '✓ Tersimpan!' : '💾 Simpan Pengaturan'}
+      <button className="btn btn-primary btn-full" onClick={save}>
+        💾 Simpan Pengaturan
       </button>
     </div>
   )
 }
 
-function Sec({ title, hint, children }) {
+/* ═══════════════════════════════════════════════════
+   OCR via Tesseract.js (loaded from CDN in index.html)
+═══════════════════════════════════════════════════ */
+
+async function runOCR(imageFile, onProgress) {
+  // window.Tesseract is injected via CDN script in index.html
+  if (!window.Tesseract) throw new Error('Tesseract.js belum dimuat. Coba refresh halaman.')
+
+  const worker = await window.Tesseract.createWorker('eng', 1, {
+    logger: (m) => {
+      if (m.status === 'recognizing text' && onProgress) {
+        onProgress(Math.round(m.progress * 100))
+      }
+    },
+  })
+
+  try {
+    const { data: { text } } = await worker.recognize(imageFile)
+    return text
+  } finally {
+    await worker.terminate()
+  }
+}
+
+// Post-process OCR text → clean up common OCR errors in tabular data
+function cleanOcrText(raw) {
+  return raw
+    .split('\n')
+    .map(line => line
+      // Fix common OCR substitutions in time fields
+      .replace(/\bO(\d)/g, '0$1')   // O7:42 → 07:42
+      .replace(/(\d)O\b/g, '$10')   // 1O:00 → 10:00
+      .replace(/[|l]{1}(?=\d{2}[:/])/g, '1') // |7:30 → 17:30
+      .replace(/\s{2,}/g, '\t')     // multiple spaces → tab (treat as column separator)
+      .trim()
+    )
+    .filter(l => l.length > 0)
+    .join('\n')
+}
+
+/* ── Upload Tab ── */
+function UploadTab({ settings, onParsed, fileInfo, setFileInfo }) {
+  const [mode, setMode]           = useState('file')
+  const [drag, setDrag]           = useState(false)
+  const [error, setError]         = useState('')
+  const [loading, setLoading]     = useState(false)
+  const [pasteText, setPasteText] = useState('')
+  const [detectedFmt, setDetectedFmt] = useState(null)
+  // OCR state
+  const [ocrImage, setOcrImage]   = useState(null)   // { url, file }
+  const [ocrText, setOcrText]     = useState('')      // editable OCR result
+  const [ocrProgress, setOcrProgress] = useState(0)
+  const [ocrDone, setOcrDone]     = useState(false)
+
+  /* ── File mode ── */
+  const processFile = useCallback((file) => {
+    if (!file) return
+    setError('')
+    setLoading(true)
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: 'array' })
+        const employees = parseFile(wb, settings)
+        setFileInfo({ name: file.name, sheets: wb.SheetNames, count: employees.length, source: 'file' })
+        onParsed(employees)
+      } catch (err) {
+        setError(err.message)
+      } finally { setLoading(false) }
+    }
+    reader.readAsArrayBuffer(file)
+  }, [settings, onParsed, setFileInfo])
+
+  /* ── Paste mode ── */
+  const processPaste = useCallback((textOverride) => {
+    const txt = textOverride ?? pasteText
+    if (!txt.trim()) return
+    setError('')
+    setLoading(true)
+    try {
+      const { employees, format } = parsePaste(txt, settings)
+      setDetectedFmt(format)
+      setFileInfo({ name: textOverride ? 'Data OCR' : 'Data tempel', sheets: [], count: employees.length, source: 'paste', format })
+      onParsed(employees)
+    } catch (err) {
+      setError(err.message)
+    } finally { setLoading(false) }
+  }, [pasteText, settings, onParsed, setFileInfo])
+
+  const handlePasteChange = (e) => {
+    const val = e.target.value
+    setPasteText(val)
+    if (val.trim().split('\n').length >= 5) {
+      try { setDetectedFmt(detectFormat(tsvTo2D(val.trim()))) }
+      catch { setDetectedFmt(null) }
+    } else { setDetectedFmt(null) }
+  }
+
+  /* ── OCR mode ── */
+  const handleImageSelect = (file) => {
+    if (!file || !file.type.startsWith('image/')) {
+      setError('Pilih file gambar (JPG, PNG, dll).')
+      return
+    }
+    setError('')
+    setOcrText('')
+    setOcrDone(false)
+    setOcrProgress(0)
+    setOcrImage({ url: URL.createObjectURL(file), file })
+  }
+
+  const runOcrOnImage = async () => {
+    if (!ocrImage) return
+    setError('')
+    setLoading(true)
+    setOcrProgress(0)
+    try {
+      const raw     = await runOCR(ocrImage.file, setOcrProgress)
+      const cleaned = cleanOcrText(raw)
+      setOcrText(cleaned)
+      setOcrDone(true)
+      // Auto-detect format
+      try { setDetectedFmt(detectFormat(tsvTo2D(cleaned))) }
+      catch { setDetectedFmt(null) }
+    } catch (err) {
+      setError(err.message)
+    } finally { setLoading(false) }
+  }
+
+  const onDrop  = (e) => { e.preventDefault(); setDrag(false); processFile(e.dataTransfer.files[0]) }
+  const onFile  = (e) => processFile(e.target.files[0])
+  const onImage = (e) => handleImageSelect(e.target.files[0])
+  const onImageDrop = (e) => { e.preventDefault(); setDrag(false); handleImageSelect(e.dataTransfer.files[0]) }
+
+  const fmtLabels = { block: '📊 Format blok karyawan', raw: '📋 Format raw punch' }
+
   return (
-    <div style={S.sec}>
-      <div style={S.secHead}>
-        <span style={S.secTitle}>{title}</span>
-        {hint && <span style={S.secHint}>{hint}</span>}
+    <div>
+      {/* ── 3-way mode toggle ── */}
+      <div className="mode-toggle">
+        <button className={`mode-btn ${mode === 'file'  ? 'active' : ''}`} onClick={() => setMode('file')}>📂 File</button>
+        <button className={`mode-btn ${mode === 'paste' ? 'active' : ''}`} onClick={() => setMode('paste')}>📋 Tempel</button>
+        <button className={`mode-btn ${mode === 'ocr'   ? 'active' : ''}`} onClick={() => setMode('ocr')}>📷 Foto</button>
       </div>
-      <div style={S.secBody}>{children}</div>
+
+      {error && <Toast type="error" msg={error} />}
+
+      {/* ════ FILE MODE ════ */}
+      {mode === 'file' && (
+        <>
+          <Toast type="info" msg="Ekspor .xls / .xlsx dari mesin absensi, lalu unggah di sini." />
+          {fileInfo?.source === 'file' && (
+            <div className="file-pill">
+              <span>📄</span>
+              <div style={{ flex: 1 }}>
+                <div className="name">{fileInfo.name}</div>
+                <div className="meta">{fileInfo.count} karyawan · {fileInfo.sheets.length} sheet</div>
+              </div>
+              <span style={{ color: 'var(--teal)', fontWeight: 700 }}>✓</span>
+            </div>
+          )}
+          <label
+            className={`upload-zone ${drag ? 'drag' : ''}`}
+            onDragOver={e => { e.preventDefault(); setDrag(true) }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={onDrop} style={{ display: 'block' }}
+          >
+            <input type="file" accept=".xls,.xlsx,.csv" onChange={onFile} />
+            <div className="icon">{loading ? '⏳' : '📂'}</div>
+            <h3>{loading ? 'Membaca file...' : 'Unggah File Absensi'}</h3>
+            <p>{loading ? 'Harap tunggu' : 'Klik atau seret file .xls / .xlsx ke sini'}</p>
+          </label>
+          {fileInfo?.source === 'file' && fileInfo.sheets.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <div className="card" style={{ marginBottom: 0 }}>
+                <div className="card-title">Sheet ditemukan</div>
+                {fileInfo.sheets.map((name, i) => (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: i < fileInfo.sheets.length - 1 ? '1px solid var(--border)' : 'none', fontSize: 13 }}>
+                    <span style={{ fontFamily: 'var(--mono)' }}>{name}</span>
+                    {i === parseInt(settings.sheetIndex) && <span className="badge badge-teal">aktif</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ════ PASTE MODE ════ */}
+      {mode === 'paste' && (
+        <>
+          <Toast type="info" msg="Di Excel: pilih tabel → Ctrl+C → tempel di sini." />
+          {fileInfo?.source === 'paste' && (
+            <div className="file-pill">
+              <span>📋</span>
+              <div style={{ flex: 1 }}>
+                <div className="name">Data tempel</div>
+                <div className="meta">{fileInfo.count} karyawan · {fmtLabels[fileInfo.format]}</div>
+              </div>
+              <span style={{ color: 'var(--teal)', fontWeight: 700 }}>✓</span>
+            </div>
+          )}
+          {detectedFmt && (
+            <div className={`format-badge ${detectedFmt === 'block' ? 'badge-teal' : 'badge-amber'}`} style={{ marginBottom: 8 }}>
+              {fmtLabels[detectedFmt]} terdeteksi
+            </div>
+          )}
+          <textarea
+            className="paste-area"
+            placeholder={'Tempel data dari Excel di sini...\n\nKolom yang didukung:\n• Format blok (Sheet 5): tabel lebar per tanggal\n• Format raw: No | DevId | UserId | UName | Verify | DateTime'}
+            value={pasteText}
+            onChange={handlePasteChange}
+            spellCheck={false}
+          />
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button className="btn btn-primary" style={{ flex: 1 }} onClick={() => processPaste()} disabled={!pasteText.trim() || loading}>
+              {loading ? '⏳ Memproses...' : '▶ Proses Data'}
+            </button>
+            {pasteText && (
+              <button className="btn btn-secondary btn-sm" onClick={() => { setPasteText(''); setDetectedFmt(null) }}>🗑️</button>
+            )}
+          </div>
+          <div style={{ marginTop: 10, fontSize: 11, color: 'var(--muted)', lineHeight: 1.6 }}>
+            💡 Di Excel: klik sel pertama → Ctrl+Shift+End → Ctrl+C → tempel di sini.
+          </div>
+        </>
+      )}
+
+      {/* ════ OCR / FOTO MODE ════ */}
+      {mode === 'ocr' && (
+        <>
+          <Toast type="info" msg="Unggah foto/screenshot tabel absensi. Teks akan diekstrak otomatis — bisa diedit sebelum diproses." />
+          <Toast type="info" msg="💡 Format raw punch (daftar baris) lebih akurat dari format blok (tabel lebar) saat di-OCR." />
+
+          {/* Image drop zone */}
+          {!ocrImage ? (
+            <label
+              className={`upload-zone ${drag ? 'drag' : ''}`}
+              onDragOver={e => { e.preventDefault(); setDrag(true) }}
+              onDragLeave={() => setDrag(false)}
+              onDrop={onImageDrop} style={{ display: 'block' }}
+            >
+              <input type="file" accept="image/*" onChange={onImage} />
+              <div className="icon">📷</div>
+              <h3>Unggah Foto / Screenshot</h3>
+              <p>JPG, PNG, atau gambar lainnya</p>
+            </label>
+          ) : (
+            <>
+              {/* Image preview */}
+              <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid var(--border)', marginBottom: 10 }}>
+                <img src={ocrImage.url} alt="preview" style={{ width: '100%', display: 'block', maxHeight: 220, objectFit: 'contain', background: '#111' }} />
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                {!ocrDone && (
+                  <button className="btn btn-primary" style={{ flex: 1 }} onClick={runOcrOnImage} disabled={loading}>
+                    {loading
+                      ? <span>🔍 Membaca teks... {ocrProgress > 0 ? `${ocrProgress}%` : ''}</span>
+                      : '🔍 Baca Teks (OCR)'}
+                  </button>
+                )}
+                <button className="btn btn-secondary btn-sm" onClick={() => { setOcrImage(null); setOcrText(''); setOcrDone(false); setOcrProgress(0); setDetectedFmt(null) }}>
+                  🗑️ Ganti foto
+                </button>
+              </div>
+
+              {/* OCR progress bar */}
+              {loading && ocrProgress > 0 && (
+                <div style={{ background: 'var(--border)', borderRadius: 4, height: 6, marginBottom: 10, overflow: 'hidden' }}>
+                  <div style={{ background: 'var(--teal)', height: '100%', width: `${ocrProgress}%`, transition: 'width .3s' }} />
+                </div>
+              )}
+
+              {/* Editable OCR result */}
+              {ocrText && (
+                <>
+                  {detectedFmt && (
+                    <div className={`format-badge ${detectedFmt === 'block' ? 'badge-teal' : 'badge-amber'}`} style={{ marginBottom: 8 }}>
+                      {fmtLabels[detectedFmt]} terdeteksi
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 6 }}>
+                    ✏️ Periksa dan perbaiki hasil OCR sebelum diproses:
+                  </div>
+                  <textarea
+                    className="paste-area"
+                    value={ocrText}
+                    onChange={e => {
+                      setOcrText(e.target.value)
+                      try { setDetectedFmt(detectFormat(tsvTo2D(e.target.value.trim()))) }
+                      catch { setDetectedFmt(null) }
+                    }}
+                    spellCheck={false}
+                    style={{ minHeight: 140 }}
+                  />
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                    <button className="btn btn-primary" style={{ flex: 1 }} onClick={() => processPaste(ocrText)} disabled={!ocrText.trim() || loading}>
+                      {loading ? '⏳ Memproses...' : '▶ Proses Data OCR'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </>
+      )}
     </div>
   )
 }
 
-function Row({ label, hint, children }) {
+/* ── Employee Detail ── */
+function EmployeeDetail({ employee, settings, onBack }) {
+  const [printMsg, setPrintMsg] = useState('')
+  const [printStatus, setPrintStatus] = useState('idle')
+  const [showPreview, setShowPreview] = useState(false)
+
+  const stats = calcStats(employee, settings)
+
+  const handlePrint = async () => {
+    setPrintStatus('printing')
+    setPrintMsg('Menghubungkan ke printer...')
+    try {
+      const data = buildEscPos(employee, stats, settings)
+      await printBluetooth(data, settings)
+      setPrintStatus('success')
+      setPrintMsg('Berhasil dicetak!')
+    } catch (err) {
+      setPrintStatus('error')
+      setPrintMsg(err.message)
+    }
+    setTimeout(() => { setPrintStatus('idle'); setPrintMsg('') }, 4000)
+  }
+
+  // Build text preview
+  const buildPreview = () => {
+    const W = 32
+    const line = (s = '') => s + '\n'
+    let out = ''
+    out += line('================================')
+    out += line(employee.name.toUpperCase())
+    out += line(`Periode: ${employee.period}`)
+    out += line('--------------------------------')
+    out += line('TGL   IN    OUT   LATE  OT')
+    out += line('--------------------------------')
+    stats.dailyData.forEach(day => {
+      const d = formatDate(day.date) || `${String(day.dayNum).padStart(2,'0')}`
+      if (!day.firstIn && !day.lastOut) {
+        out += line(`${d}      -      -     ABSEN`)
+      } else {
+        const inT  = (day.firstIn  || '-').padEnd(6)
+        const outT = (day.lastOut  || '-').padEnd(6)
+        const late = (day.lateMinutes > 0 ? `${day.lateMinutes}m` : '0').padEnd(6)
+        const ot   = minsToDisplay(day.otMinutes)
+        out += line(`${d} ${inT}${outT}${late}${ot}`)
+      }
+    })
+    out += line('--------------------------------')
+    out += line(`Hadir        : ${stats.totalPresent} hari`)
+    out += line(`Absen        : ${stats.totalAbsent} hari`)
+    out += line(`Tot.Terlambat: ${stats.totalLate} menit`)
+    out += line(`Tot.Lembur   : ${minsToDisplay(stats.totalOT)}`)
+    out += line('================================')
+    return out
+  }
+
   return (
-    <div style={S.row}>
-      <div style={S.rowLeft}>
-        <div style={S.rowLabel}>{label}</div>
-        {hint && <div style={S.rowHint}>{hint}</div>}
+    <div>
+      <button className="back-btn" onClick={onBack}>
+        ← Kembali ke daftar
+      </button>
+
+      <div className="card" style={{ marginBottom: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div className="emp-avatar" style={{ width: 48, height: 48, fontSize: 20 }}>
+            {employee.name[0]?.toUpperCase()}
+          </div>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>{employee.name}</div>
+            <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>
+              ID: {employee.id || '-'} · {employee.period}
+            </div>
+          </div>
+        </div>
       </div>
-      <div style={S.rowRight}>{children}</div>
+
+      <div className="stats-row four">
+        <div className="stat-chip">
+          <div className="val">{stats.totalPresent}</div>
+          <div className="lbl">Hadir</div>
+        </div>
+        <div className="stat-chip red">
+          <div className="val">{stats.totalAbsent}</div>
+          <div className="lbl">Absen</div>
+        </div>
+        <div className="stat-chip amber">
+          <div className="val">{stats.totalLate}</div>
+          <div className="lbl">Tlb (m)</div>
+        </div>
+        <div className="stat-chip">
+          <div className="val">{minsToDisplay(stats.totalOT)}</div>
+          <div className="lbl">Lembur</div>
+        </div>
+      </div>
+
+      {printMsg && (
+        <Toast type={printStatus === 'error' ? 'error' : printStatus === 'success' ? 'success' : 'info'} msg={printMsg} />
+      )}
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+        <button className="btn btn-primary" style={{ flex: 1 }} onClick={handlePrint} disabled={printStatus === 'printing'}>
+          {printStatus === 'printing' ? '⏳ Mencetak...' : '🖨️ Cetak ke Printer'}
+        </button>
+        <button className="btn btn-secondary btn-sm" onClick={() => setShowPreview(!showPreview)}>
+          {showPreview ? '🙈' : '👁️'}
+        </button>
+      </div>
+
+      {showPreview && (
+        <div className="print-preview">{buildPreview()}</div>
+      )}
+
+      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+        <table className="day-table">
+          <thead>
+            <tr>
+              <th>Tgl</th>
+              <th>Masuk</th>
+              <th>Keluar</th>
+              <th>Tlb</th>
+              <th>OT</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stats.dailyData.map((day, i) => (
+              <tr key={i} className={!day.firstIn && !day.lastOut ? 'absent' : ''}>
+                <td>
+                  <div style={{ fontWeight: 600 }}>{formatDate(day.date) || String(day.dayNum).padStart(2,'0')}</div>
+                  <div style={{ fontSize: 9, color: 'var(--muted)' }}>{day.dayOfWeek}</div>
+                </td>
+                <td>{day.firstIn || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
+                <td>{day.lastOut || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
+                <td>
+                  {!day.firstIn && !day.lastOut
+                    ? <span className="badge badge-muted">ABSEN</span>
+                    : day.lateMinutes > 0
+                      ? <span className="badge badge-red">{day.lateMinutes}m</span>
+                      : <span style={{ color: 'var(--muted)' }}>0</span>
+                  }
+                </td>
+                <td>
+                  {day.otMinutes > 0
+                    ? <span className="badge badge-amber">{minsToDisplay(day.otMinutes)}</span>
+                    : <span style={{ color: 'var(--muted)' }}>—</span>
+                  }
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {employee.days.some(d => d.amOut && d.pmIn && !d.pmIn.toLowerCase().includes('absence')) && (
+        <div className="card" style={{ marginTop: 12 }}>
+          <div className="card-title">Detail Istirahat</div>
+          <table className="day-table">
+            <thead>
+              <tr><th>Tgl</th><th>Keluar Ist.</th><th>Masuk Ist.</th></tr>
+            </thead>
+            <tbody>
+              {employee.days
+                .filter(d => d.amOut && d.pmIn && !d.pmIn.toLowerCase().includes('absence'))
+                .map((day, i) => (
+                  <tr key={i}>
+                    <td>{formatDate(day.date) || String(day.dayNum).padStart(2,'0')}</td>
+                    <td>{day.amOut}</td>
+                    <td>{day.pmIn}</td>
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
 
-// ============================================================
-// STYLES
-// ============================================================
+/* ── Employees Tab ── */
+function EmployeesTab({ employees, settings }) {
+  const [selected, setSelected] = useState(null)
+  const [search, setSearch]     = useState('')
 
-const C = {
-  bg:      '#0c0e14',
-  surface: '#13161f',
-  card:    '#191c28',
-  border:  '#252840',
-  text:    '#e2e8f0',
-  muted:   '#64748b',
-  subtle:  '#94a3b8',
-  amber:   '#f59e0b',
-  amberLo: '#78350f',
+  if (selected) return (
+    <EmployeeDetail
+      employee={selected}
+      settings={settings}
+      onBack={() => setSelected(null)}
+    />
+  )
+
+  if (!employees.length) return (
+    <div className="empty">
+      <div className="icon">👥</div>
+      <h3>Belum ada data</h3>
+      <p>Unggah file absensi di tab Upload terlebih dahulu.</p>
+    </div>
+  )
+
+  const filtered = employees.filter(e =>
+    e.name.toLowerCase().includes(search.toLowerCase()) ||
+    e.id.toString().includes(search)
+  )
+
+  return (
+    <div>
+      <div className="search-wrap">
+        <svg className="search-icon" viewBox="0 0 20 20" fill="currentColor" width="14" height="14">
+          <path fillRule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clipRule="evenodd" />
+        </svg>
+        <input
+          className="search-input"
+          placeholder="Cari nama atau ID..."
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+        />
+      </div>
+
+      <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 10, fontFamily: 'var(--mono)' }}>
+        {filtered.length} dari {employees.length} karyawan
+      </div>
+
+      {filtered.map((emp, i) => {
+        const stats = calcStats(emp, settings)
+        return (
+          <div key={i} className="emp-item" onClick={() => setSelected(emp)}>
+            <div className="emp-avatar">{emp.name[0]?.toUpperCase()}</div>
+            <div className="emp-info">
+              <div className="emp-name">{emp.name}</div>
+              <div className="emp-meta">
+                Hadir {stats.totalPresent} · Absen {stats.totalAbsent} ·
+                Tlb {stats.totalLate}m · OT {minsToDisplay(stats.totalOT)}
+              </div>
+            </div>
+            <svg className="emp-arrow" viewBox="0 0 20 20" fill="currentColor" width="16" height="16">
+              <path fillRule="evenodd" d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z" clipRule="evenodd" />
+            </svg>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
-const S = {
-  app:     { minHeight: '100vh', background: C.bg, color: C.text, fontFamily: "'DM Sans', 'Segoe UI', system-ui, sans-serif", fontSize: 14 },
+/* ═══════════════════════════════════════════════════
+   MAIN APP
+═══════════════════════════════════════════════════ */
 
-  // NAV
-  nav:       { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 20px', height: 52, background: C.surface, borderBottom: `1px solid ${C.border}`, position: 'sticky', top: 0, zIndex: 100 },
-  navBrand:  { display: 'flex', alignItems: 'center', gap: 8, fontWeight: 700, fontSize: 15, color: C.amber, letterSpacing: '-0.3px' },
-  navIcon:   { fontSize: 18, lineHeight: 1 },
-  navLinks:  { display: 'flex', gap: 2 },
-  navBtn:    { background: 'none', border: 'none', color: C.muted, padding: '6px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 13, fontWeight: 500, transition: 'color .15s' },
-  navBtnOn:  { background: '#1e2035', color: C.amber },
+export default function App() {
+  const [tab, setTab]           = useState('upload')
+  const [employees, setEmployees] = useState([])
+  const [fileInfo, setFileInfo] = useState(null)
+  const [settings, setSettings] = useState(() => {
+    try {
+      const saved = localStorage.getItem('att_settings')
+      return saved ? { ...DEFAULT_SETTINGS, ...JSON.parse(saved) } : DEFAULT_SETTINGS
+    } catch { return DEFAULT_SETTINGS }
+  })
 
-  // PAGES
-  page:     { maxWidth: 880, margin: '0 auto', padding: '28px 16px 60px' },
-  pageHead: { marginBottom: 24 },
-  h1:       { fontSize: 22, fontWeight: 700, margin: '0 0 4px', color: '#f1f5f9', letterSpacing: '-0.5px' },
-  sub:      { color: C.muted, fontSize: 13, margin: 0 },
+  // Inject CSS once
+  useEffect(() => {
+    const style = document.createElement('style')
+    style.textContent = CSS
+    document.head.appendChild(style)
+    return () => document.head.removeChild(style)
+  }, [])
 
-  // TOAST
-  toast:      { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#3b0a0a', color: '#fca5a5', padding: '10px 20px', borderLeft: '3px solid #ef4444' },
-  toastClose: { background: 'none', border: 'none', color: '#fca5a5', cursor: 'pointer', fontSize: 20, lineHeight: 1 },
+  const saveSettings = (s) => {
+    setSettings(s)
+    localStorage.setItem('att_settings', JSON.stringify(s))
+  }
 
-  // UPLOAD
-  drop:       { border: `2px dashed ${C.border}`, borderRadius: 14, padding: '56px 24px', textAlign: 'center', cursor: 'pointer', transition: 'all .2s', marginBottom: 20 },
-  dropActive: { borderColor: C.amber, background: '#1a1200' },
-  dropEmoji:  { fontSize: 52, marginBottom: 14 },
-  dropLabel:  { fontSize: 16, color: C.subtle, marginBottom: 6 },
-  dropHint:   { fontSize: 12, color: C.muted, fontFamily: 'monospace' },
-  btNote:     { display: 'flex', alignItems: 'center', gap: 8, background: C.surface, border: `1px solid ${C.border}`, borderLeft: `3px solid ${C.amber}`, borderRadius: 8, padding: '10px 14px', fontSize: 12, color: C.muted },
-  btDot:      { color: C.amber, flexShrink: 0 },
+  const handleParsed = (emps) => {
+    setEmployees(emps)
+    setTab('employees')
+  }
 
-  // LIST
-  search: { width: '100%', boxSizing: 'border-box', background: C.surface, border: `1px solid ${C.border}`, color: C.text, padding: '10px 14px', borderRadius: 8, fontSize: 14, marginBottom: 16, outline: 'none' },
-  grid:   { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 10 },
-  card:   { background: C.card, borderRadius: 10, padding: '16px', cursor: 'pointer', border: `1px solid ${C.border}`, position: 'relative', transition: 'border-color .15s' },
-  cardName:  { fontWeight: 600, fontSize: 15, marginBottom: 12, color: '#f1f5f9', paddingRight: 20 },
-  cardStats: { display: 'flex', gap: 14, flexWrap: 'wrap' },
-  cardArrow: { position: 'absolute', top: 16, right: 14, color: C.muted, fontSize: 14 },
-  chip:      { display: 'flex', flexDirection: 'column', alignItems: 'center' },
-  chipVal:   { fontSize: 16, fontWeight: 700, lineHeight: 1.2 },
-  chipLabel: { fontSize: 10, color: C.muted, marginTop: 2 },
+  const TABS = [
+    { id: 'upload',    label: 'Upload',    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    )},
+    { id: 'employees', label: 'Karyawan',  icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+    )},
+    { id: 'settings',  label: 'Pengaturan', icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+    )},
+  ]
 
-  // DETAIL
-  detailTop:   { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24, flexWrap: 'wrap', gap: 16 },
-  summaryRow:  { display: 'flex', gap: 16, marginTop: 10, flexWrap: 'wrap' },
-  sumCard:     { background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: '10px 14px', minWidth: 90 },
-  sumVal:      { fontSize: 20, fontWeight: 700, lineHeight: 1 },
-  sumUnit:     { fontSize: 12, fontWeight: 400 },
-  sumLabel:    { fontSize: 10, color: C.muted, marginTop: 4 },
-  printGroup:  { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 },
-  printBtn:    { background: C.amber, color: '#000', border: 'none', padding: '11px 22px', borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: 'pointer', whiteSpace: 'nowrap' },
-  printStatus: { fontSize: 12, fontWeight: 500 },
+  return (
+    <div id="app-root">
+      <div className="app-header">
+        <div className="logo">🕐</div>
+        <div>
+          <h1>Absensi Printer</h1>
+          <p>v1.0 · WebBluetooth · 58mm</p>
+        </div>
+        {employees.length > 0 && (
+          <div style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--teal)' }}>
+            {employees.length} karyawan
+          </div>
+        )}
+      </div>
 
-  // TABLE
-  tblWrap: { overflowX: 'auto', borderRadius: 10, border: `1px solid ${C.border}` },
-  tbl:     { width: '100%', borderCollapse: 'collapse', fontSize: 13 },
-  th:      { padding: '9px 12px', textAlign: 'left', color: C.muted, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap', fontSize: 11, textTransform: 'uppercase', letterSpacing: '.5px', background: C.surface },
-  tr:      { borderBottom: `1px solid #0f111a` },
-  trAlt:   { background: '#10121b' },
-  trAbs:   { background: '#160a0a' },
-  td:      { padding: '7px 12px', verticalAlign: 'middle' },
-  tdDate:  { fontWeight: 600, color: C.subtle, whiteSpace: 'nowrap' },
-  tdMono:  { padding: '7px 12px', fontFamily: "'Fira Code', monospace", fontSize: 12.5, verticalAlign: 'middle', color: C.subtle },
-  absTag:  { background: '#450a0a', color: '#f87171', fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4, letterSpacing: '.5px' },
+      <div className="app-body">
+        {tab === 'upload'    && <UploadTab    settings={settings} onParsed={handleParsed} fileInfo={fileInfo} setFileInfo={setFileInfo} />}
+        {tab === 'employees' && <EmployeesTab employees={employees} settings={settings} />}
+        {tab === 'settings'  && <SettingsTab  settings={settings} onSave={saveSettings} />}
+      </div>
 
-  // SETTINGS
-  sec:      { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, marginBottom: 14, overflow: 'hidden' },
-  secHead:  { display: 'flex', alignItems: 'baseline', gap: 10, padding: '12px 18px', borderBottom: `1px solid ${C.border}`, background: '#0f1119' },
-  secTitle: { fontWeight: 600, color: C.amber, fontSize: 13 },
-  secHint:  { fontSize: 11, color: C.muted },
-  secBody:  { padding: '4px 0' },
-  row:      { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', padding: '10px 18px', borderBottom: `1px solid #0f1119`, flexWrap: 'wrap', gap: 8 },
-  rowLeft:  { flex: 1, minWidth: 160 },
-  rowRight: { flexShrink: 0 },
-  rowLabel: { fontSize: 13, color: C.text, fontWeight: 500 },
-  rowHint:  { fontSize: 11, color: C.muted, marginTop: 2 },
-  inp:      { background: C.bg, border: `1px solid ${C.border}`, color: C.text, padding: '7px 10px', borderRadius: 6, fontSize: 13, width: '100%', boxSizing: 'border-box', outline: 'none' },
-  dayBtn:   { background: C.bg, border: `1px solid ${C.border}`, color: C.muted, padding: '5px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 500 },
-  dayBtnOn: { background: C.amberLo, border: `1px solid ${C.amber}`, color: C.amber },
-  saveBtn:  { width: '100%', background: C.amber, color: '#000', border: 'none', padding: '13px', borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: 'pointer', marginTop: 4, transition: 'background .2s' },
-  saveBtnOk:{ background: '#16a34a', color: '#fff' },
+      <nav className="bottom-nav">
+        {TABS.map(t => (
+          <button
+            key={t.id}
+            className={`nav-btn ${tab === t.id ? 'active' : ''}`}
+            onClick={() => setTab(t.id)}
+          >
+            {t.icon}
+            {t.label}
+          </button>
+        ))}
+      </nav>
+    </div>
+  )
 }
