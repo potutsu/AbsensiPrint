@@ -154,34 +154,67 @@ function parseFile(workbook, s) {
 ═══════════════════════════════════════════════════ */
 
 // Convert TSV/clipboard text → 2D array
+// Handles tab-separated OR multi-space-separated (tabs lost when copying from txt viewer)
 function tsvTo2D(text) {
-  return text.split('\n').map(row =>
-    row.split('\t').map(c => c.trim().replace(/\r/g, ''))
-  )
+  const lines = text.split('\n').map(l => l.replace(/\r/g, ''))
+  const hasTab = lines.some(l => l.includes('\t'))
+  if (hasTab) {
+    return lines.map(row => row.split('\t').map(c => c.trim()))
+  }
+  // No tabs: split on 2+ consecutive spaces
+  return lines.map(row => {
+    if (!row.trim()) return ['']
+    const cols = row.split(/  +/).map(c => c.trim()).filter(c => c.length > 0)
+    // Rejoin date + time that got split: "2026/03/09" + "08:42:00"
+    const rejoined = []
+    for (let i = 0; i < cols.length; i++) {
+      if (
+        /^\d{4}[\/\-]\d{2}[\/\-]\d{2}$/.test(cols[i]) &&
+        i + 1 < cols.length &&
+        /^\d{2}:\d{2}/.test(cols[i + 1])
+      ) {
+        rejoined.push(cols[i] + ' ' + cols[i + 1])
+        i++
+      } else {
+        rejoined.push(cols[i])
+      }
+    }
+    return rejoined
+  })
 }
 
 // Detect format: 'block' (Sheet 5 layout) or 'raw' (punch rows)
 function detectFormat(data) {
-  // Block layout: wide table, first col has day patterns like "01 Mo", "02 Tu"
+  // Datetime pattern in any cell → definitely raw punch
+  const dtPattern = /\d{4}[\/\-]\d{2}[\/\-]\d{2}[\s T]\d{2}:\d{2}/
+  let dtMatches = 0
+  for (const row of data.slice(0, 20)) {
+    for (const cell of row) {
+      if (dtPattern.test(String(cell))) { dtMatches++; break }
+    }
+  }
+  if (dtMatches >= 2) return 'raw'
+
+  // Block layout: wide table, first col has day patterns like "01 Mo"
   const dayPattern = /^\d{1,2}\s+(Su|Mo|Tu|We|Th|Fr|Sa)$/
   let dayMatches = 0, maxCols = 0
   for (const row of data) {
     if (row.length > maxCols) maxCols = row.length
-    if (dayPattern.test(row[0])) dayMatches++
+    if (dayPattern.test(String(row[0] || ''))) dayMatches++
   }
   if (dayMatches >= 3 && maxCols >= 10) return 'block'
 
-  // Raw punches: narrow table with time values (HH:MM)
+  // Standalone HH:MM time cells → raw
   const timePattern = /^\d{2}:\d{2}(:\d{2})?$/
   let timeMatches = 0
   for (const row of data.slice(1, 20)) {
     for (const cell of row) {
-      if (timePattern.test(cell)) { timeMatches++; break }
+      if (timePattern.test(String(cell))) { timeMatches++; break }
     }
   }
-  if (timeMatches >= 3) return 'raw'
+  if (timeMatches >= 2) return 'raw'
 
-  return 'block' // default fallback
+  return 'block'
 }
 
 // Parse block layout 2D array (same logic as parseFile but from array)
@@ -817,6 +850,67 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); }
   margin-bottom: 8px;
 }
 
+/* ── Edit Modal ── */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,.7); backdrop-filter: blur(4px);
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.modal-sheet {
+  background: var(--card);
+  border-radius: 20px 20px 0 0;
+  width: 100%; max-width: 480px;
+  max-height: 92dvh;
+  display: flex; flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 16px 10px;
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.modal-header h2 { font-size: 15px; font-weight: 700; }
+.modal-close {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px; cursor: pointer;
+}
+.modal-body { flex: 1; overflow-y: auto; padding: 12px 16px; }
+.modal-footer {
+  padding: 12px 16px 20px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; flex-shrink: 0;
+}
+
+/* Edit day card */
+.edit-day-card {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 10px; margin-bottom: 10px; overflow: hidden;
+}
+.edit-day-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(30,50,81,.5);
+  font-size: 12px; font-weight: 700;
+}
+.edit-day-header .dow { font-size: 10px; color: var(--muted); font-weight: 400; margin-left: 6px; }
+.edit-day-body { padding: 10px 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.edit-field label {
+  display: block; font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px;
+}
+.edit-field input[type=time] {
+  width: 100%; padding: 7px 8px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text);
+  font-family: var(--mono); font-size: 13px; outline: none;
+}
+.edit-field input[type=time]:focus { border-color: var(--teal); }
+.edited-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--amber); display: inline-block; margin-left: 6px;
+}
+
 /* ── Print preview ── */
 .print-preview {
   background: #f8f8f8; color: #111;
@@ -1339,19 +1433,107 @@ function UploadTab({ settings, onParsed, fileInfo, setFileInfo }) {
   )
 }
 
+/* ── Edit Modal ── */
+function EditModal({ days, originalDays, onChange, onClose }) {
+  const FIELDS = [
+    { key: 'amIn',  label: 'AM Masuk'  },
+    { key: 'amOut', label: 'AM Keluar' },
+    { key: 'pmIn',  label: 'Ist Masuk' },
+    { key: 'pmOut', label: 'Ist Keluar'},
+    { key: 'otIn',  label: 'OT Masuk'  },
+    { key: 'otOut', label: 'OT Keluar' },
+  ]
+
+  const isEdited = (day, i) => {
+    const orig = originalDays[i]
+    if (!orig) return true
+    return FIELDS.some(f => (day[f.key] || '') !== (orig[f.key] || ''))
+  }
+
+  const setField = (dayIdx, field, value) => {
+    const next = days.map((d, i) => i === dayIdx ? { ...d, [field]: value, isAbsent: false } : d)
+    // Auto-recalc isAbsent: if all 6 fields empty → absent
+    const d = next[dayIdx]
+    const allEmpty = FIELDS.every(f => !d[f.key])
+    next[dayIdx] = { ...next[dayIdx], isAbsent: allEmpty }
+    onChange(next)
+  }
+
+  const DOW_ID = { Mo:'Sen', Tu:'Sel', We:'Rab', Th:'Kam', Fr:'Jum', Sa:'Sab', Su:'Min' }
+
+  return (
+    <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal-sheet">
+        <div className="modal-header">
+          <h2>✏️ Edit Data Absen</h2>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 12, lineHeight: 1.6 }}>
+            Edit jam langsung di kolom. Kosongkan untuk hapus. Titik kuning = sudah diubah.
+          </div>
+          {days.map((day, i) => {
+            const edited = isEdited(day, i)
+            const label  = formatDate(day.date) || String(day.dayNum).padStart(2,'0')
+            const dow    = DOW_ID[day.dayOfWeek] || day.dayOfWeek
+            return (
+              <div key={i} className="edit-day-card">
+                <div className="edit-day-header">
+                  <span>
+                    {label}
+                    <span className="dow">{dow}</span>
+                    {edited && <span className="edited-dot" title="Diubah" />}
+                  </span>
+                  {day.isAbsent && <span className="badge badge-muted" style={{ fontSize: 9 }}>ABSEN</span>}
+                </div>
+                <div className="edit-day-body">
+                  {FIELDS.map(({ key, label: lbl }) => (
+                    <div key={key} className="edit-field">
+                      <label>{lbl}</label>
+                      <input
+                        type="time"
+                        value={day[key] || ''}
+                        onChange={e => setField(i, key, e.target.value)}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+        <div className="modal-footer">
+          <button className="btn btn-secondary" style={{ flex: 1 }} onClick={onClose}>
+            ✓ Selesai
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ── Employee Detail ── */
 function EmployeeDetail({ employee, settings, onBack }) {
-  const [printMsg, setPrintMsg] = useState('')
+  const [printMsg, setPrintMsg]     = useState('')
   const [printStatus, setPrintStatus] = useState('idle')
   const [showPreview, setShowPreview] = useState(false)
+  const [showEdit, setShowEdit]     = useState(false)
+  // Editable copy of days — starts from original, user can modify
+  const [editedDays, setEditedDays] = useState(() => employee.days.map(d => ({ ...d })))
+  const hasEdits = editedDays.some((d, i) => {
+    const o = employee.days[i]
+    return ['amIn','amOut','pmIn','pmOut','otIn','otOut'].some(k => (d[k]||'') !== (o[k]||''))
+  })
 
-  const stats = calcStats(employee, settings)
+  // Use editedDays for stats + print
+  const workingEmployee = { ...employee, days: editedDays }
+  const stats = calcStats(workingEmployee, settings)
 
   const handlePrint = async () => {
     setPrintStatus('printing')
     setPrintMsg('Menghubungkan ke printer...')
     try {
-      const data = buildEscPos(employee, stats, settings)
+      const data = buildEscPos(workingEmployee, stats, settings)
       await printBluetooth(data, settings)
       setPrintStatus('success')
       setPrintMsg('Berhasil dicetak!')
@@ -1362,14 +1544,12 @@ function EmployeeDetail({ employee, settings, onBack }) {
     setTimeout(() => { setPrintStatus('idle'); setPrintMsg('') }, 4000)
   }
 
-  // Build text preview
   const buildPreview = () => {
-    const W = 32
     const line = (s = '') => s + '\n'
     let out = ''
     out += line('================================')
-    out += line(employee.name.toUpperCase())
-    out += line(`Periode: ${employee.period}`)
+    out += line(workingEmployee.name.toUpperCase())
+    out += line(`Periode: ${workingEmployee.period}`)
     out += line('--------------------------------')
     out += line('TGL   IN    OUT   LATE  OT')
     out += line('--------------------------------')
@@ -1396,6 +1576,15 @@ function EmployeeDetail({ employee, settings, onBack }) {
 
   return (
     <div>
+      {showEdit && (
+        <EditModal
+          days={editedDays}
+          originalDays={employee.days}
+          onChange={setEditedDays}
+          onClose={() => setShowEdit(false)}
+        />
+      )}
+
       <button className="back-btn" onClick={onBack}>
         ← Kembali ke daftar
       </button>
@@ -1405,8 +1594,11 @@ function EmployeeDetail({ employee, settings, onBack }) {
           <div className="emp-avatar" style={{ width: 48, height: 48, fontSize: 20 }}>
             {employee.name[0]?.toUpperCase()}
           </div>
-          <div>
-            <div style={{ fontSize: 16, fontWeight: 700 }}>{employee.name}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>
+              {employee.name}
+              {hasEdits && <span className="badge badge-amber" style={{ marginLeft: 8, fontSize: 10 }}>Diedit</span>}
+            </div>
             <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>
               ID: {employee.id || '-'} · {employee.period}
             </div>
@@ -1441,9 +1633,17 @@ function EmployeeDetail({ employee, settings, onBack }) {
         <button className="btn btn-primary" style={{ flex: 1 }} onClick={handlePrint} disabled={printStatus === 'printing'}>
           {printStatus === 'printing' ? '⏳ Mencetak...' : '🖨️ Cetak ke Printer'}
         </button>
-        <button className="btn btn-secondary btn-sm" onClick={() => setShowPreview(!showPreview)}>
+        <button className="btn btn-secondary btn-sm" onClick={() => setShowEdit(true)} title="Edit data">
+          ✏️
+        </button>
+        <button className="btn btn-secondary btn-sm" onClick={() => setShowPreview(!showPreview)} title="Preview cetak">
           {showPreview ? '🙈' : '👁️'}
         </button>
+        {hasEdits && (
+          <button className="btn btn-danger btn-sm" onClick={() => setEditedDays(employee.days.map(d => ({ ...d })))} title="Reset ke data asli">
+            ↩️
+          </button>
+        )}
       </div>
 
       {showPreview && (
@@ -1462,35 +1662,43 @@ function EmployeeDetail({ employee, settings, onBack }) {
             </tr>
           </thead>
           <tbody>
-            {stats.dailyData.map((day, i) => (
-              <tr key={i} className={!day.firstIn && !day.lastOut ? 'absent' : ''}>
-                <td>
-                  <div style={{ fontWeight: 600 }}>{formatDate(day.date) || String(day.dayNum).padStart(2,'0')}</div>
-                  <div style={{ fontSize: 9, color: 'var(--muted)' }}>{day.dayOfWeek}</div>
-                </td>
-                <td>{day.firstIn || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
-                <td>{day.lastOut || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
-                <td>
-                  {!day.firstIn && !day.lastOut
-                    ? <span className="badge badge-muted">ABSEN</span>
-                    : day.lateMinutes > 0
-                      ? <span className="badge badge-red">{day.lateMinutes}m</span>
-                      : <span style={{ color: 'var(--muted)' }}>0</span>
-                  }
-                </td>
-                <td>
-                  {day.otMinutes > 0
-                    ? <span className="badge badge-amber">{minsToDisplay(day.otMinutes)}</span>
-                    : <span style={{ color: 'var(--muted)' }}>—</span>
-                  }
-                </td>
-              </tr>
-            ))}
+            {stats.dailyData.map((day, i) => {
+              const wasEdited = ['amIn','amOut','pmIn','pmOut','otIn','otOut'].some(k =>
+                (editedDays[i]?.[k]||'') !== (employee.days[i]?.[k]||'')
+              )
+              return (
+                <tr key={i} className={!day.firstIn && !day.lastOut ? 'absent' : ''}>
+                  <td>
+                    <div style={{ fontWeight: 600 }}>
+                      {formatDate(day.date) || String(day.dayNum).padStart(2,'0')}
+                      {wasEdited && <span className="edited-dot" style={{ marginLeft: 4 }} />}
+                    </div>
+                    <div style={{ fontSize: 9, color: 'var(--muted)' }}>{day.dayOfWeek}</div>
+                  </td>
+                  <td>{day.firstIn || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
+                  <td>{day.lastOut || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
+                  <td>
+                    {!day.firstIn && !day.lastOut
+                      ? <span className="badge badge-muted">ABSEN</span>
+                      : day.lateMinutes > 0
+                        ? <span className="badge badge-red">{day.lateMinutes}m</span>
+                        : <span style={{ color: 'var(--muted)' }}>0</span>
+                    }
+                  </td>
+                  <td>
+                    {day.otMinutes > 0
+                      ? <span className="badge badge-amber">{minsToDisplay(day.otMinutes)}</span>
+                      : <span style={{ color: 'var(--muted)' }}>—</span>
+                    }
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
 
-      {employee.days.some(d => d.amOut && d.pmIn && !d.pmIn.toLowerCase().includes('absence')) && (
+      {editedDays.some(d => d.amOut && d.pmIn && !d.pmIn.toLowerCase().includes('absence')) && (
         <div className="card" style={{ marginTop: 12 }}>
           <div className="card-title">Detail Istirahat</div>
           <table className="day-table">
@@ -1498,7 +1706,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
               <tr><th>Tgl</th><th>Keluar Ist.</th><th>Masuk Ist.</th></tr>
             </thead>
             <tbody>
-              {employee.days
+              {editedDays
                 .filter(d => d.amOut && d.pmIn && !d.pmIn.toLowerCase().includes('absence'))
                 .map((day, i) => (
                   <tr key={i}>
