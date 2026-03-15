@@ -31,6 +31,7 @@ const DEFAULT_SETTINGS = {
   scheduleStart: '08:00',
   scheduleEnd: '17:00',
   graceMinutes: '5',
+  graceOutMinutes: '5',
   includeSaturday: false,
   printFontSize: 'normal',
   // Sheet column mapping
@@ -439,8 +440,13 @@ function parsePaste(text, settings) {
 ═══════════════════════════════════════════════════ */
 
 function calcStats(employee, s) {
-  const schedStart = timeToMins(s.scheduleStart) + parseInt(s.graceMinutes)
-  const schedEnd   = timeToMins(s.scheduleEnd)
+  const graceIn  = parseInt(s.graceMinutes    || 0)
+  const graceOut = parseInt(s.graceOutMinutes || 0)
+  const schedStart    = timeToMins(s.scheduleStart)          // raw start e.g. 420 (07:00)
+  const lateThreshold = schedStart + graceIn                 // e.g. 425 (07:05) — clock-in must be before this
+  const schedEnd      = timeToMins(s.scheduleEnd)            // raw end e.g. 1020 (17:00)
+  const otThreshold   = schedEnd + graceOut                  // e.g. 1025 (17:05) — must clock out after this for OT
+
   let totalPresent = 0, totalAbsent = 0, totalLate = 0, totalOT = 0
 
   const dailyData = employee.days.map(day => {
@@ -461,8 +467,16 @@ function calcStats(employee, s) {
 
     const inMins  = timeToMins(firstIn)
     const outMins = timeToMins(lastOut)
-    const late    = inMins  !== null ? Math.max(0, inMins  - schedStart) : 0
-    const ot      = outMins !== null ? Math.max(0, outMins - schedEnd)   : 0
+
+    // Late: only if clock-in is after threshold; counted from threshold (not raw start)
+    const late = inMins !== null && inMins > lateThreshold
+      ? inMins - lateThreshold
+      : 0
+
+    // OT: only if clock-out is after OT threshold; counted from threshold (not raw end)
+    const ot = outMins !== null && outMins > otThreshold
+      ? outMins - otThreshold
+      : 0
 
     totalLate += late
     totalOT   += ot
@@ -519,11 +533,11 @@ function buildEscPos(employee, stats, settings) {
     } else {
       const inT  = (day.firstIn  || '-').padEnd(6)
       const outT = (day.lastOut  || '-').padEnd(6)
-      const late = (day.lateMinutes > 0 ? `${day.lateMinutes}m` : '0').padEnd(6)
+      const late = (day.lateMinutes > 0 ? `${minsToDisplay(day.lateMinutes)}` : '0').padEnd(6)
       const ot   = minsToDisplay(day.otMinutes)
       if (large) {
         line(`${d} ${inT}${outT}`)
-        line(`     L:${(day.lateMinutes > 0 ? day.lateMinutes+'m' : '0').padEnd(5)} OT:${ot}`)
+        line(`     L:${(day.lateMinutes > 0 ? minsToDisplay(day.lateMinutes) : '0').padEnd(5)} OT:${ot}`)
       } else {
         line(`${d} ${inT}${outT}${late}${ot}`)
       }
@@ -533,7 +547,7 @@ function buildEscPos(employee, stats, settings) {
   line('--------------------------------')
   line(`Hadir        : ${stats.totalPresent} hari`)
   line(`Absen        : ${stats.totalAbsent} hari`)
-  line(`Tot.Terlambat: ${stats.totalLate} menit`)
+  line(`Tot.Terlambat: ${minsToDisplay(stats.totalLate)}`)
   line(`Tot.Lembur   : ${minsToDisplay(stats.totalOT)}`)
   center()
   line('================================')
@@ -1005,9 +1019,15 @@ function SettingsTab({ settings, onSave }) {
             <input type="time" value={s.scheduleEnd} onChange={e => set('scheduleEnd', e.target.value)} />
           </div>
         </div>
-        <div className="field">
-          <label>Toleransi Terlambat (menit)</label>
-          <input type="number" min="0" max="60" value={s.graceMinutes} onChange={e => set('graceMinutes', e.target.value)} />
+        <div className="field-row">
+          <div className="field">
+            <label>Toleransi Masuk (menit)</label>
+            <input type="number" min="0" max="60" value={s.graceMinutes} onChange={e => set('graceMinutes', e.target.value)} />
+          </div>
+          <div className="field">
+            <label>Toleransi Keluar (menit)</label>
+            <input type="number" min="0" max="60" value={s.graceOutMinutes} onChange={e => set('graceOutMinutes', e.target.value)} />
+          </div>
         </div>
         <div className="toggle-row">
           <span>Masuk Sabtu</span>
@@ -1560,7 +1580,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
       } else {
         const inT  = (day.firstIn  || '-').padEnd(6)
         const outT = (day.lastOut  || '-').padEnd(6)
-        const late = (day.lateMinutes > 0 ? `${day.lateMinutes}m` : '0').padEnd(6)
+        const late = (day.lateMinutes > 0 ? `${minsToDisplay(day.lateMinutes)}` : '0').padEnd(6)
         const ot   = minsToDisplay(day.otMinutes)
         out += line(`${d} ${inT}${outT}${late}${ot}`)
       }
@@ -1568,7 +1588,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
     out += line('--------------------------------')
     out += line(`Hadir        : ${stats.totalPresent} hari`)
     out += line(`Absen        : ${stats.totalAbsent} hari`)
-    out += line(`Tot.Terlambat: ${stats.totalLate} menit`)
+    out += line(`Tot.Terlambat: ${minsToDisplay(stats.totalLate)}`)
     out += line(`Tot.Lembur   : ${minsToDisplay(stats.totalOT)}`)
     out += line('================================')
     return out
@@ -1616,8 +1636,8 @@ function EmployeeDetail({ employee, settings, onBack }) {
           <div className="lbl">Absen</div>
         </div>
         <div className="stat-chip amber">
-          <div className="val">{stats.totalLate}</div>
-          <div className="lbl">Tlb (m)</div>
+          <div className="val">{minsToDisplay(stats.totalLate)}</div>
+          <div className="lbl">Terlambat</div>
         </div>
         <div className="stat-chip">
           <div className="val">{minsToDisplay(stats.totalOT)}</div>
@@ -1681,7 +1701,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
                     {!day.firstIn && !day.lastOut
                       ? <span className="badge badge-muted">ABSEN</span>
                       : day.lateMinutes > 0
-                        ? <span className="badge badge-red">{day.lateMinutes}m</span>
+                        ? <span className="badge badge-red">{minsToDisplay(day.lateMinutes)}</span>
                         : <span style={{ color: 'var(--muted)' }}>0</span>
                     }
                   </td>
@@ -1777,7 +1797,7 @@ function EmployeesTab({ employees, settings }) {
               <div className="emp-name">{emp.name}</div>
               <div className="emp-meta">
                 Hadir {stats.totalPresent} · Absen {stats.totalAbsent} ·
-                Tlb {stats.totalLate}m · OT {minsToDisplay(stats.totalOT)}
+                Tlb {minsToDisplay(stats.totalLate)} · OT {minsToDisplay(stats.totalOT)}
               </div>
             </div>
             <svg className="emp-arrow" viewBox="0 0 20 20" fill="currentColor" width="16" height="16">
