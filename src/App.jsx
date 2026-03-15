@@ -22,6 +22,12 @@ const minsToDisplay = (mins) => {
   return `${h}j ${m}m`
 }
 
+const formatAttendance = (val) => {
+  if (val === undefined || val === null) return '0'
+  // Show as integer if whole number, otherwise show .5
+  return Number.isInteger(val) ? String(val) : val.toFixed(1)
+}
+
 const formatDate = (date) => {
   if (!date) return ''
   return `${String(date.getDate()).padStart(2,'0')}/${String(date.getMonth()+1).padStart(2,'0')}`
@@ -32,6 +38,8 @@ const DEFAULT_SETTINGS = {
   scheduleEnd: '17:00',
   graceMinutes: '5',
   graceOutMinutes: '5',
+  shiftStartTime: '06:00',
+  halfDayThresholdHours: '5',
   includeSaturday: false,
   printFontSize: 'normal',
   // Sheet column mapping
@@ -457,13 +465,48 @@ function calcStats(employee, s) {
   const lateThreshold = schedStart + graceIn          // e.g. 425 (07:05)
   const schedEnd      = timeToMins(s.scheduleEnd)    // e.g. 1020 (17:00)
   const otThreshold   = schedEnd + graceOut           // e.g. 1025 (17:05)
+  const shiftStart    = timeToMins(s.shiftStartTime || '06:00') // e.g. 360 (06:00)
+  const halfDayMins   = parseFloat(s.halfDayThresholdHours || 5) * 60 // e.g. 300 mins
 
   let totalPresent = 0, totalAbsent = 0, totalLate = 0, totalOT = 0
 
-  const dailyData = employee.days.map(day => {
+  // Build a working copy of days with shift-start carryover applied:
+  // Any punch before shiftStart belongs to previous day's pulang (overnight OT)
+  const adjustedDays = employee.days.map((day, i) => {
+    const masukMins = timeToMins(day.masuk || '')
+    // If masuk is before shift start → this punch is prev-day OT carryover
+    // Use next valid punch (from middlePunches or pulang) as actual masuk
+    if (masukMins !== null && masukMins < shiftStart) {
+      const allPunches = [day.masuk, ...(day.middlePunches || []), day.pulang]
+        .filter(t => t && /^\d{2}:\d{2}/.test(t))
+        .filter(t => (timeToMins(t) || 0) >= shiftStart)
+        .sort()
+      return {
+        ...day,
+        masuk:         allPunches[0] || '',
+        pulang:        allPunches.length > 1 ? allPunches[allPunches.length - 1] : day.pulang || '',
+        middlePunches: allPunches.slice(1, -1),
+        // Carry the early punch back to previous day as pulang
+        _carryoverPulang: day.masuk,
+      }
+    }
+    return day
+  })
+
+  // Apply carryover: if a day has _carryoverPulang, push it to previous day
+  adjustedDays.forEach((day, i) => {
+    if (day._carryoverPulang && i > 0) {
+      const prev = adjustedDays[i - 1]
+      if (!prev.pulang) {
+        adjustedDays[i - 1] = { ...prev, pulang: day._carryoverPulang }
+      }
+    }
+  })
+
+  const dailyData = adjustedDays.map(day => {
     if (day.isAbsent) {
       totalAbsent++
-      return { ...day, lateMinutes: 0, otMinutes: 0, firstIn: null, lastOut: null }
+      return { ...day, lateMinutes: 0, otMinutes: 0, firstIn: null, lastOut: null, attendance: 0 }
     }
 
     const firstIn = day.masuk  || null
@@ -471,19 +514,23 @@ function calcStats(employee, s) {
 
     if (!firstIn && !lastOut) {
       totalAbsent++
-      return { ...day, lateMinutes: 0, otMinutes: 0, firstIn: null, lastOut: null }
+      return { ...day, lateMinutes: 0, otMinutes: 0, firstIn: null, lastOut: null, attendance: 0 }
     }
-
-    totalPresent++
 
     const inMins = timeToMins(firstIn)
     let outMins  = timeToMins(lastOut)
 
-    // Midnight clock-out: if clock-out time is earlier than schedule start
-    // (e.g. 02:18 on a 07:00 schedule) treat as next-day by adding 1440 mins
-    if (outMins !== null && outMins < schedStart) {
+    // Midnight clock-out (pulang after midnight but before shiftStart) → add 1440
+    if (outMins !== null && outMins < shiftStart) {
       outMins += 1440
     }
+
+    // Worked duration
+    const workedMins = (inMins !== null && outMins !== null) ? outMins - inMins : 0
+
+    // Half-day: worked less than halfDayMins threshold
+    const attendance = workedMins > 0 && workedMins < halfDayMins ? 0.5 : (workedMins > 0 ? 1 : 0)
+    totalPresent += attendance
 
     // Late: only if past threshold; counted from threshold
     const late = inMins !== null && inMins > lateThreshold
@@ -498,7 +545,7 @@ function calcStats(employee, s) {
     totalLate += late
     totalOT   += ot
 
-    return { ...day, lateMinutes: late, otMinutes: ot, firstIn, lastOut }
+    return { ...day, lateMinutes: late, otMinutes: ot, firstIn, lastOut, attendance }
   })
 
   return { dailyData, totalPresent, totalAbsent, totalLate, totalOT }
@@ -562,8 +609,8 @@ function buildEscPos(employee, stats, settings) {
   })
 
   line('--------------------------------')
-  line(`Hadir        : ${stats.totalPresent} hari`)
-  line(`Absen        : ${stats.totalAbsent} hari`)
+  line(`Hadir        : ${formatAttendance(stats.totalPresent)} hari`)
+  line(`Absen        : ${formatAttendance(stats.totalAbsent)} hari`)
   line(`Tot.Terlambat: ${minsToDisplay(stats.totalLate)}`)
   line(`Tot.Lembur   : ${minsToDisplay(stats.totalOT)}`)
   center()
@@ -1049,6 +1096,19 @@ function SettingsTab({ settings, onSave }) {
             <label>Toleransi Keluar (menit)</label>
             <input type="number" min="0" max="60" value={s.graceOutMinutes} onChange={e => set('graceOutMinutes', e.target.value)} />
           </div>
+        </div>
+        <div className="field-row">
+          <div className="field">
+            <label>Batas Mulai Shift</label>
+            <input type="time" value={s.shiftStartTime} onChange={e => set('shiftStartTime', e.target.value)} />
+          </div>
+          <div className="field">
+            <label>Ambang ½ Hari (jam)</label>
+            <input type="number" min="1" max="12" step="0.5" value={s.halfDayThresholdHours} onChange={e => set('halfDayThresholdHours', e.target.value)} />
+          </div>
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 14, lineHeight: 1.6 }}>
+          💡 Scan sebelum <strong>Batas Mulai Shift</strong> dihitung sebagai lembur hari sebelumnya, bukan jam masuk hari ini.
         </div>
         <div className="toggle-row">
           <span>Masuk Sabtu</span>
@@ -1639,8 +1699,8 @@ function EmployeeDetail({ employee, settings, onBack }) {
       }
     })
     out += line('--------------------------------')
-    out += line(`Hadir        : ${stats.totalPresent} hari`)
-    out += line(`Absen        : ${stats.totalAbsent} hari`)
+    out += line(`Hadir        : ${formatAttendance(stats.totalPresent)} hari`)
+    out += line(`Absen        : ${formatAttendance(stats.totalAbsent)} hari`)
     out += line(`Tot.Terlambat: ${minsToDisplay(stats.totalLate)}`)
     out += line(`Tot.Lembur   : ${minsToDisplay(stats.totalOT)}`)
     out += line('================================')
@@ -1681,11 +1741,11 @@ function EmployeeDetail({ employee, settings, onBack }) {
 
       <div className="stats-row four">
         <div className="stat-chip">
-          <div className="val">{stats.totalPresent}</div>
+          <div className="val">{formatAttendance(stats.totalPresent)}</div>
           <div className="lbl">Hadir</div>
         </div>
         <div className="stat-chip red">
-          <div className="val">{stats.totalAbsent}</div>
+          <div className="val">{formatAttendance(stats.totalAbsent)}</div>
           <div className="lbl">Absen</div>
         </div>
         <div className="stat-chip amber">
@@ -1748,7 +1808,10 @@ function EmployeeDetail({ employee, settings, onBack }) {
                     </div>
                     <div style={{ fontSize: 9, color: 'var(--muted)' }}>{day.dayOfWeek}</div>
                   </td>
-                  <td>{day.firstIn || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
+                  <td>
+                    {day.firstIn || <span style={{ color: 'var(--muted)' }}>—</span>}
+                    {day.attendance === 0.5 && <span className="badge badge-amber" style={{ marginLeft: 4, fontSize: 9 }}>½</span>}
+                  </td>
                   <td>{day.lastOut || <span style={{ color: 'var(--muted)' }}>—</span>}</td>
                   <td>
                     {!day.firstIn && !day.lastOut
@@ -1849,7 +1912,7 @@ function EmployeesTab({ employees, settings }) {
             <div className="emp-info">
               <div className="emp-name">{emp.name}</div>
               <div className="emp-meta">
-                Hadir {stats.totalPresent} · Absen {stats.totalAbsent} ·
+                Hadir {formatAttendance(stats.totalPresent)} · Absen {formatAttendance(stats.totalAbsent)} ·
                 Tlb {minsToDisplay(stats.totalLate)} · OT {minsToDisplay(stats.totalOT)}
               </div>
             </div>
