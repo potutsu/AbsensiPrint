@@ -1542,7 +1542,7 @@ function EditModal({ days, originalDays, onChange, onClose }) {
                     <div className="edit-field" style={{ gridColumn: '1 / -1' }}>
                       <label>Scan Tengah (hanya tampil)</label>
                       <div style={{ padding: '7px 8px', background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)' }}>
-                        {day.middlePunches.join('  ·  ')}
+                        {(day.middlePunches || []).join('  ·  ')}
                       </div>
                     </div>
                   )}
@@ -1574,8 +1574,16 @@ function EmployeeDetail({ employee, settings, onBack }) {
       const saved = localStorage.getItem(storageKey)
       if (saved) {
         const parsed = JSON.parse(saved)
-        // Validate same number of days before restoring
-        if (parsed.length === employee.days.length) return parsed
+        if (parsed.length === employee.days.length) {
+          // Sanitize: ensure new fields exist (guards against stale cache structure)
+          return parsed.map((d, i) => ({
+            ...employee.days[i],  // base from fresh data
+            masuk:  d.masuk  ?? d.amIn  ?? '',
+            pulang: d.pulang ?? d.amOut ?? '',
+            middlePunches: Array.isArray(d.middlePunches) ? d.middlePunches : (employee.days[i].middlePunches || []),
+            isAbsent: d.isAbsent ?? employee.days[i].isAbsent,
+          }))
+        }
       }
     } catch {}
     return employee.days.map(d => ({ ...d }))
@@ -1776,7 +1784,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
                 .map((day, i) => (
                   <tr key={i}>
                     <td>{formatDate(day.date) || String(day.dayNum).padStart(2,'0')}</td>
-                    <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{day.middlePunches.join('  ·  ')}</td>
+                    <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{(day.middlePunches || []).join('  ·  ')}</td>
                   </tr>
                 ))
               }
@@ -1795,6 +1803,7 @@ function EmployeesTab({ employees, settings }) {
 
   if (selected) return (
     <EmployeeDetail
+      key={selected.name}
       employee={selected}
       settings={settings}
       onBack={() => setSelected(null)}
