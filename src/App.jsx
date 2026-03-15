@@ -122,15 +122,24 @@ function parseFile(workbook, s) {
       if (isSun) continue
       if (isSat && !s.includeSaturday) continue
 
-      const amIn  = String(row[blockCol + parseInt(s.amInOffset)]  || '').trim()
-      const amOut = String(row[blockCol + parseInt(s.amOutOffset)] || '').trim()
-      const pmIn  = String(row[blockCol + parseInt(s.pmInOffset)]  || '').trim()
-      const pmOut = String(row[blockCol + parseInt(s.pmOutOffset)] || '').trim()
-      const otIn  = String(row[blockCol + parseInt(s.otInOffset)]  || '').trim()
-      const otOut = String(row[blockCol + parseInt(s.otOutOffset)] || '').trim()
+      // Collect all slot values from Sheet 5 — treat as raw punches, assign first/last
+      const slots = [
+        String(row[blockCol + parseInt(s.amInOffset)]  || '').trim(),
+        String(row[blockCol + parseInt(s.amOutOffset)] || '').trim(),
+        String(row[blockCol + parseInt(s.pmInOffset)]  || '').trim(),
+        String(row[blockCol + parseInt(s.pmOutOffset)] || '').trim(),
+        String(row[blockCol + parseInt(s.otInOffset)]  || '').trim(),
+        String(row[blockCol + parseInt(s.otOutOffset)] || '').trim(),
+      ]
+      const hasAbsence = slots.some(t => t.toLowerCase().includes('absence'))
+      const validPunches = slots
+        .filter(t => t && /^\d{2}:\d{2}/.test(t))
+        .sort()
 
-      const isAbsent = pmIn.toLowerCase().includes('absence') ||
-                       (!amIn && !amOut && !pmIn && !pmOut && !otIn && !otOut)
+      const masuk  = validPunches[0] || ''
+      const pulang = validPunches.length > 1 ? validPunches[validPunches.length - 1] : ''
+      const middlePunches = validPunches.slice(1, -1)
+      const isAbsent = hasAbsence || validPunches.length === 0
 
       let date = null
       if (startDate) {
@@ -138,7 +147,7 @@ function parseFile(workbook, s) {
         date.setDate(startDate.getDate() + dayNum - 1)
       }
 
-      days.push({ dayNum, dayOfWeek, date, amIn, amOut, pmIn, pmOut, otIn, otOut, isAbsent })
+      days.push({ dayNum, dayOfWeek, date, masuk, pulang, middlePunches, isAbsent })
     }
 
     employees.push({ name: nameVal, id: idVal, period, startDate, days })
@@ -268,19 +277,24 @@ function parseBlockData(data, s) {
       if (dayOfWeek === 'Sa' && !s.includeSaturday) continue
 
       const get = (off) => String(row[blockCol + parseInt(off)] || '').trim()
-      const amIn = get(s.amInOffset), amOut = get(s.amOutOffset)
-      const pmIn = get(s.pmInOffset), pmOut = get(s.pmOutOffset)
-      const otIn = get(s.otInOffset), otOut = get(s.otOutOffset)
-
-      const isAbsent = pmIn.toLowerCase().includes('absence') ||
-                       (!amIn && !amOut && !pmIn && !pmOut && !otIn && !otOut)
+      const slots2 = [
+        get(s.amInOffset), get(s.amOutOffset),
+        get(s.pmInOffset), get(s.pmOutOffset),
+        get(s.otInOffset), get(s.otOutOffset),
+      ]
+      const hasAbsence2 = slots2.some(t => t.toLowerCase().includes('absence'))
+      const validPunches2 = slots2.filter(t => t && /^\d{2}:\d{2}/.test(t)).sort()
+      const masuk2  = validPunches2[0] || ''
+      const pulang2 = validPunches2.length > 1 ? validPunches2[validPunches2.length - 1] : ''
+      const middlePunches2 = validPunches2.slice(1, -1)
+      const isAbsent = hasAbsence2 || validPunches2.length === 0
 
       let date = null
       if (startDate) {
         date = new Date(startDate)
         date.setDate(startDate.getDate() + dayNum - 1)
       }
-      days.push({ dayNum, dayOfWeek, date, amIn, amOut, pmIn, pmOut, otIn, otOut, isAbsent })
+      days.push({ dayNum, dayOfWeek, date, masuk: masuk2, pulang: pulang2, middlePunches: middlePunches2, isAbsent })
     }
 
     employees.push({ name: nameVal, id: idVal, period, startDate, days })
@@ -407,16 +421,13 @@ function parseRawData(data) {
       const date   = new Date(dateStr)
       const dow    = ['Su','Mo','Tu','We','Th','Fr','Sa'][date.getDay()]
       return {
-        dayNum:    date.getDate(),
-        dayOfWeek: dow,
+        dayNum:       date.getDate(),
+        dayOfWeek:    dow,
         date,
-        amIn:  sorted[0] || '',
-        amOut: sorted.length >= 4 ? sorted[1] : '',
-        pmIn:  sorted.length >= 4 ? sorted[2] : (sorted.length === 3 ? sorted[1] : ''),
-        pmOut: sorted.length >= 4 ? sorted[3] : (sorted.length === 3 ? sorted[2] : sorted[1] || ''),
-        otIn:  sorted.length >= 6 ? sorted[4] : '',
-        otOut: sorted.length >= 6 ? sorted[5] : '',
-        isAbsent: false,
+        masuk:        sorted[0] || '',
+        pulang:       sorted.length > 1 ? sorted[sorted.length - 1] : '',
+        middlePunches: sorted.slice(1, -1),
+        isAbsent:     false,
       }
     }).sort((a, b) => a.date - b.date)
 
@@ -440,12 +451,12 @@ function parsePaste(text, settings) {
 ═══════════════════════════════════════════════════ */
 
 function calcStats(employee, s) {
-  const graceIn  = parseInt(s.graceMinutes    || 0)
-  const graceOut = parseInt(s.graceOutMinutes || 0)
-  const schedStart    = timeToMins(s.scheduleStart)          // raw start e.g. 420 (07:00)
-  const lateThreshold = schedStart + graceIn                 // e.g. 425 (07:05) — clock-in must be before this
-  const schedEnd      = timeToMins(s.scheduleEnd)            // raw end e.g. 1020 (17:00)
-  const otThreshold   = schedEnd + graceOut                  // e.g. 1025 (17:05) — must clock out after this for OT
+  const graceIn     = parseInt(s.graceMinutes    || 0)
+  const graceOut    = parseInt(s.graceOutMinutes || 0)
+  const schedStart    = timeToMins(s.scheduleStart)  // e.g. 420 (07:00)
+  const lateThreshold = schedStart + graceIn          // e.g. 425 (07:05)
+  const schedEnd      = timeToMins(s.scheduleEnd)    // e.g. 1020 (17:00)
+  const otThreshold   = schedEnd + graceOut           // e.g. 1025 (17:05)
 
   let totalPresent = 0, totalAbsent = 0, totalLate = 0, totalOT = 0
 
@@ -455,8 +466,8 @@ function calcStats(employee, s) {
       return { ...day, lateMinutes: 0, otMinutes: 0, firstIn: null, lastOut: null }
     }
 
-    const firstIn  = day.amIn || null
-    const lastOut  = day.otOut || day.pmOut || day.amOut || null
+    const firstIn = day.masuk  || null
+    const lastOut = day.pulang || null
 
     if (!firstIn && !lastOut) {
       totalAbsent++
@@ -465,15 +476,21 @@ function calcStats(employee, s) {
 
     totalPresent++
 
-    const inMins  = timeToMins(firstIn)
-    const outMins = timeToMins(lastOut)
+    const inMins = timeToMins(firstIn)
+    let outMins  = timeToMins(lastOut)
 
-    // Late: only if clock-in is after threshold; counted from threshold (not raw start)
+    // Midnight clock-out: if clock-out time is earlier than schedule start
+    // (e.g. 02:18 on a 07:00 schedule) treat as next-day by adding 1440 mins
+    if (outMins !== null && outMins < schedStart) {
+      outMins += 1440
+    }
+
+    // Late: only if past threshold; counted from threshold
     const late = inMins !== null && inMins > lateThreshold
       ? inMins - lateThreshold
       : 0
 
-    // OT: only if clock-out is after OT threshold; counted from threshold (not raw end)
+    // OT: only if past OT threshold; counted from threshold
     const ot = outMins !== null && outMins > otThreshold
       ? outMins - otThreshold
       : 0
@@ -918,8 +935,12 @@ body { background: var(--bg); color: var(--text); font-family: var(--sans); }
   background: var(--card); border: 1px solid var(--border);
   border-radius: 6px; color: var(--text);
   font-family: var(--mono); font-size: 13px; outline: none;
+  -webkit-appearance: none; appearance: none;
 }
 .edit-field input[type=time]:focus { border-color: var(--teal); }
+/* Force 24h clock on all browsers/Android */
+.edit-field input[type=time]::-webkit-datetime-edit-ampm-field { display: none; }
+.edit-field input[type=time]::-webkit-inner-spin-button { display: none; }
 .edited-dot {
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--amber); display: inline-block; margin-left: 6px;
@@ -1121,16 +1142,16 @@ function SettingsTab({ settings, onSave }) {
               Offset kolom dalam tiap blok karyawan:
             </div>
             <div className="field-row">
-              <div className="field"><label>AM In</label>  <input type="number" min="0" value={s.amInOffset}  onChange={e => set('amInOffset',  e.target.value)} /></div>
-              <div className="field"><label>AM Out</label> <input type="number" min="0" value={s.amOutOffset} onChange={e => set('amOutOffset', e.target.value)} /></div>
+              <div className="field"><label>Masuk 1</label>  <input type="number" min="0" value={s.amInOffset}  onChange={e => set('amInOffset',  e.target.value)} /></div>
+              <div className="field"><label>Keluar 1</label> <input type="number" min="0" value={s.amOutOffset} onChange={e => set('amOutOffset', e.target.value)} /></div>
             </div>
             <div className="field-row">
-              <div className="field"><label>PM In</label>  <input type="number" min="0" value={s.pmInOffset}  onChange={e => set('pmInOffset',  e.target.value)} /></div>
-              <div className="field"><label>PM Out</label> <input type="number" min="0" value={s.pmOutOffset} onChange={e => set('pmOutOffset', e.target.value)} /></div>
+              <div className="field"><label>Masuk 2</label>  <input type="number" min="0" value={s.pmInOffset}  onChange={e => set('pmInOffset',  e.target.value)} /></div>
+              <div className="field"><label>Keluar 2</label> <input type="number" min="0" value={s.pmOutOffset} onChange={e => set('pmOutOffset', e.target.value)} /></div>
             </div>
             <div className="field-row">
-              <div className="field"><label>OT In</label>  <input type="number" min="0" value={s.otInOffset}  onChange={e => set('otInOffset',  e.target.value)} /></div>
-              <div className="field"><label>OT Out</label> <input type="number" min="0" value={s.otOutOffset} onChange={e => set('otOutOffset', e.target.value)} /></div>
+              <div className="field"><label>OT Masuk</label>  <input type="number" min="0" value={s.otInOffset}  onChange={e => set('otInOffset',  e.target.value)} /></div>
+              <div className="field"><label>OT Keluar</label> <input type="number" min="0" value={s.otOutOffset} onChange={e => set('otOutOffset', e.target.value)} /></div>
             </div>
           </>
         )}
@@ -1207,7 +1228,9 @@ function UploadTab({ settings, onParsed, fileInfo, setFileInfo }) {
       try {
         const wb = XLSX.read(e.target.result, { type: 'array' })
         const employees = parseFile(wb, settings)
-        setFileInfo({ name: file.name, sheets: wb.SheetNames, count: employees.length, source: 'file' })
+        const fi = { name: file.name, sheets: wb.SheetNames, count: employees.length, source: 'file' }
+        setFileInfo(fi)
+        localStorage.setItem('att_fileinfo', JSON.stringify(fi))
         onParsed(employees)
       } catch (err) {
         setError(err.message)
@@ -1225,7 +1248,9 @@ function UploadTab({ settings, onParsed, fileInfo, setFileInfo }) {
     try {
       const { employees, format } = parsePaste(txt, settings)
       setDetectedFmt(format)
-      setFileInfo({ name: textOverride ? 'Data OCR' : 'Data tempel', sheets: [], count: employees.length, source: 'paste', format })
+      const fi2 = { name: textOverride ? 'Data OCR' : 'Data tempel', sheets: [], count: employees.length, source: 'paste', format }
+      setFileInfo(fi2)
+      localStorage.setItem('att_fileinfo', JSON.stringify(fi2))
       onParsed(employees)
     } catch (err) {
       setError(err.message)
@@ -1456,26 +1481,22 @@ function UploadTab({ settings, onParsed, fileInfo, setFileInfo }) {
 /* ── Edit Modal ── */
 function EditModal({ days, originalDays, onChange, onClose }) {
   const FIELDS = [
-    { key: 'amIn',  label: 'AM Masuk'  },
-    { key: 'amOut', label: 'AM Keluar' },
-    { key: 'pmIn',  label: 'Ist Masuk' },
-    { key: 'pmOut', label: 'Ist Keluar'},
-    { key: 'otIn',  label: 'OT Masuk'  },
-    { key: 'otOut', label: 'OT Keluar' },
+    { key: 'masuk',  label: 'Masuk'  },
+    { key: 'pulang', label: 'Pulang' },
   ]
 
   const isEdited = (day, i) => {
     const orig = originalDays[i]
     if (!orig) return true
-    return FIELDS.some(f => (day[f.key] || '') !== (orig[f.key] || ''))
+    // Check all 6 fields including OT (OT edits may come from raw parser)
+    return ['masuk','pulang'].some(k => (day[k] || '') !== (orig[k] || ''))
   }
 
   const setField = (dayIdx, field, value) => {
-    const next = days.map((d, i) => i === dayIdx ? { ...d, [field]: value, isAbsent: false } : d)
-    // Auto-recalc isAbsent: if all 6 fields empty → absent
+    const next = days.map((d, i) => i === dayIdx ? { ...d, [field]: value } : d)
+    // Auto-recalc isAbsent: if both masuk and pulang empty → absent
     const d = next[dayIdx]
-    const allEmpty = FIELDS.every(f => !d[f.key])
-    next[dayIdx] = { ...next[dayIdx], isAbsent: allEmpty }
+    next[dayIdx] = { ...d, isAbsent: !d.masuk && !d.pulang }
     onChange(next)
   }
 
@@ -1517,6 +1538,14 @@ function EditModal({ days, originalDays, onChange, onClose }) {
                       />
                     </div>
                   ))}
+                  {day.middlePunches && day.middlePunches.length > 0 && (
+                    <div className="edit-field" style={{ gridColumn: '1 / -1' }}>
+                      <label>Scan Tengah (hanya tampil)</label>
+                      <div style={{ padding: '7px 8px', background: 'var(--card)', border: '1px solid var(--border)', borderRadius: 6, fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--muted)' }}>
+                        {day.middlePunches.join('  ·  ')}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )
@@ -1538,11 +1567,27 @@ function EmployeeDetail({ employee, settings, onBack }) {
   const [printStatus, setPrintStatus] = useState('idle')
   const [showPreview, setShowPreview] = useState(false)
   const [showEdit, setShowEdit]     = useState(false)
-  // Editable copy of days — starts from original, user can modify
-  const [editedDays, setEditedDays] = useState(() => employee.days.map(d => ({ ...d })))
+  // Editable copy of days — restore from localStorage if available
+  const storageKey = `att_edits_${employee.name}`
+  const [editedDays, setEditedDays] = useState(() => {
+    try {
+      const saved = localStorage.getItem(storageKey)
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        // Validate same number of days before restoring
+        if (parsed.length === employee.days.length) return parsed
+      }
+    } catch {}
+    return employee.days.map(d => ({ ...d }))
+  })
+
+  const saveEdits = (days) => {
+    setEditedDays(days)
+    localStorage.setItem(storageKey, JSON.stringify(days))
+  }
   const hasEdits = editedDays.some((d, i) => {
     const o = employee.days[i]
-    return ['amIn','amOut','pmIn','pmOut','otIn','otOut'].some(k => (d[k]||'') !== (o[k]||''))
+    return ['masuk','pulang'].some(k => (d[k]||'') !== (o[k]||''))
   })
 
   // Use editedDays for stats + print
@@ -1600,7 +1645,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
         <EditModal
           days={editedDays}
           originalDays={employee.days}
-          onChange={setEditedDays}
+          onChange={saveEdits}
           onClose={() => setShowEdit(false)}
         />
       )}
@@ -1660,7 +1705,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
           {showPreview ? '🙈' : '👁️'}
         </button>
         {hasEdits && (
-          <button className="btn btn-danger btn-sm" onClick={() => setEditedDays(employee.days.map(d => ({ ...d })))} title="Reset ke data asli">
+          <button className="btn btn-danger btn-sm" onClick={() => { saveEdits(employee.days.map(d => ({ ...d }))); localStorage.removeItem(storageKey) }} title="Reset ke data asli">
             ↩️
           </button>
         )}
@@ -1683,7 +1728,7 @@ function EmployeeDetail({ employee, settings, onBack }) {
           </thead>
           <tbody>
             {stats.dailyData.map((day, i) => {
-              const wasEdited = ['amIn','amOut','pmIn','pmOut','otIn','otOut'].some(k =>
+              const wasEdited = ['masuk','pulang'].some(k =>
                 (editedDays[i]?.[k]||'') !== (employee.days[i]?.[k]||'')
               )
               return (
@@ -1718,21 +1763,20 @@ function EmployeeDetail({ employee, settings, onBack }) {
         </table>
       </div>
 
-      {editedDays.some(d => d.amOut && d.pmIn && !d.pmIn.toLowerCase().includes('absence')) && (
+      {editedDays.some(d => d.middlePunches && d.middlePunches.length > 0) && (
         <div className="card" style={{ marginTop: 12 }}>
-          <div className="card-title">Detail Istirahat</div>
+          <div className="card-title">Scan Tengah (Istirahat)</div>
           <table className="day-table">
             <thead>
-              <tr><th>Tgl</th><th>Keluar Ist.</th><th>Masuk Ist.</th></tr>
+              <tr><th>Tgl</th><th>Waktu Scan</th></tr>
             </thead>
             <tbody>
               {editedDays
-                .filter(d => d.amOut && d.pmIn && !d.pmIn.toLowerCase().includes('absence'))
+                .filter(d => d.middlePunches && d.middlePunches.length > 0)
                 .map((day, i) => (
                   <tr key={i}>
                     <td>{formatDate(day.date) || String(day.dayNum).padStart(2,'0')}</td>
-                    <td>{day.amOut}</td>
-                    <td>{day.pmIn}</td>
+                    <td style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{day.middlePunches.join('  ·  ')}</td>
                   </tr>
                 ))
               }
@@ -1816,8 +1860,26 @@ function EmployeesTab({ employees, settings }) {
 
 export default function App() {
   const [tab, setTab]           = useState('upload')
-  const [employees, setEmployees] = useState([])
-  const [fileInfo, setFileInfo] = useState(null)
+  const [employees, setEmployees] = useState(() => {
+    try {
+      const ver = localStorage.getItem('att_ver')
+      if (ver !== '2') {
+        // Clear old incompatible data
+        localStorage.removeItem('att_employees')
+        localStorage.removeItem('att_fileinfo')
+        localStorage.setItem('att_ver', '2')
+        return []
+      }
+      const saved = localStorage.getItem('att_employees')
+      return saved ? JSON.parse(saved) : []
+    } catch { return [] }
+  })
+  const [fileInfo, setFileInfo] = useState(() => {
+    try {
+      const saved = localStorage.getItem('att_fileinfo')
+      return saved ? JSON.parse(saved) : null
+    } catch { return null }
+  })
   const [settings, setSettings] = useState(() => {
     try {
       const saved = localStorage.getItem('att_settings')
@@ -1840,7 +1902,16 @@ export default function App() {
 
   const handleParsed = (emps) => {
     setEmployees(emps)
+    localStorage.setItem('att_employees', JSON.stringify(emps))
     setTab('employees')
+  }
+
+  const handleClearData = () => {
+    setEmployees([])
+    setFileInfo(null)
+    localStorage.removeItem('att_employees')
+    localStorage.removeItem('att_fileinfo')
+    setTab('upload')
   }
 
   const TABS = [
@@ -1864,8 +1935,18 @@ export default function App() {
           <p>v1.0 · WebBluetooth · 58mm</p>
         </div>
         {employees.length > 0 && (
-          <div style={{ marginLeft: 'auto', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--teal)' }}>
-            {employees.length} karyawan
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--teal)' }}>
+              {employees.length} karyawan
+            </span>
+            <button
+              className="btn btn-danger btn-sm"
+              style={{ padding: '4px 8px', fontSize: 11 }}
+              onClick={handleClearData}
+              title="Hapus semua data"
+            >
+              🗑️ Hapus
+            </button>
           </div>
         )}
       </div>
