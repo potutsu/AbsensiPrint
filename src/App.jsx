@@ -204,7 +204,7 @@ function tsvTo2D(text) {
 // Detect format: 'block' (Sheet 5 layout) or 'raw' (punch rows)
 function detectFormat(data) {
   // Datetime pattern in any cell → definitely raw punch
-  const dtPattern = /\d{4}[\/\-]\d{2}[\/\-]\d{2}[\s T]\d{2}:\d{2}/
+  const dtPattern = /\d{4}[\/\-]\d{2}[\/\-]\d{2}[\s T]+\d{2}:\d{2}/
   let dtMatches = 0
   for (const row of data.slice(0, 20)) {
     for (const cell of row) {
@@ -342,7 +342,8 @@ function parseRawData(data) {
     let nameCol = -1
     for (let c = dtCol - 1; c >= 0; c--) {
       const val = String(row[c]).trim()
-      if (val && nameRE.test(val)) { nameCol = c; break }
+      // Skip pure numbers and short numeric codes (like "001" Verify field)
+      if (val && nameRE.test(val) && !/^\d+$/.test(val)) { nameCol = c; break }
     }
     if (nameCol >= 0) {
       cols = { name: nameCol, datetime: dtCol }
@@ -380,7 +381,7 @@ function parseRawData(data) {
   for (let r = headerIdx + 1; r < data.length; r++) {
     const row  = data[r]
     const name = String(row[cols.name] || '').trim().replace(/\s+/g, ' ')
-    if (!name || name.toLowerCase() === 'name' || name.toLowerCase() === 'uname') continue
+    if (!name || /^\d+$/.test(name) || name.toLowerCase() === 'name' || name.toLowerCase() === 'uname') continue
 
     let dateStr = '', timeStr = ''
 
@@ -417,7 +418,11 @@ function parseRawData(data) {
     punchMap[name][dateKey].push(timeStr)
   }
 
-  if (Object.keys(punchMap).length === 0) throw new Error('Tidak ada data absen ditemukan. Pastikan kolom Name dan Time tersedia.')
+  if (Object.keys(punchMap).length === 0) {
+    const diagRow = data[headerIdx + 1] || []
+    const diagInfo = `cols=${JSON.stringify(cols)} | row1=[${diagRow.slice(0,8).map(c=>String(c).trim().slice(0,15)).join(' | ')}]`
+    throw new Error(`Tidak ada data absen ditemukan. Pastikan kolom Name dan Time tersedia.\nDiagnostik: ${diagInfo}`)
+  }
 
   const periodStr = minDate && maxDate
     ? `${minDate.toLocaleDateString('id-ID')} ~ ${maxDate.toLocaleDateString('id-ID')}`
