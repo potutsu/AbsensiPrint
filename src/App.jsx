@@ -319,56 +319,56 @@ function parseBlockData(data, s) {
 //       OR: No | Name  | Date   | Time
 //       OR: any reasonable variation
 function parseRawData(data) {
-  // Find header row — flexible: matches Name/UName, DateTime/Date+Time
-  let headerIdx = -1, cols = {}
-  const heuristics = {
-    id:       /^(no\.?|id|no)$/i,
-    name:     /^(name|uname|u\.?name|nama)$/i,
-    date:     /^(date|tanggal)$/i,
-    time:     /^(time|jam)$/i,
-    datetime: /^(date\s*[-\/]?\s*time|datetime|tanggal\s*jam)$/i,
+  // ── Step 1: Find header row index ──
+  let headerIdx = 0
+  const headerHints = /^(no\.?|id|name|uname|datetime|date|time|verify|devid|userid)/i
+  for (let r = 0; r < Math.min(8, data.length); r++) {
+    const hits = data[r].filter(c => headerHints.test(String(c).trim())).length
+    if (hits >= 2) { headerIdx = r; break }
   }
-  for (let r = 0; r < Math.min(10, data.length); r++) {
-    const row = data[r].map(c => String(c).toLowerCase().trim())
-    const found = {}
-    row.forEach((cell, i) => {
-      if (heuristics.id.test(cell))       found.id       = i
-      if (heuristics.name.test(cell))     found.name     = i
-      if (heuristics.date.test(cell))     found.date     = i
-      if (heuristics.time.test(cell))     found.time     = i
-      if (heuristics.datetime.test(cell)) found.datetime = i
-    })
-    // Need at least a name column AND some time info
-    const hasTime = found.time !== undefined || found.datetime !== undefined
-    // Also accept if a column value looks like a datetime (fallback)
-    if (found.name !== undefined && hasTime) {
-      headerIdx = r; cols = found; break
+
+  // ── Step 2: Detect actual column positions from DATA rows (not header) ──
+  // This is immune to header padding tabs (e.g. "UName\t\t\t\t" in header)
+  const dtScanRE = /^(\d{4}[\/\-]\d{2}[\/\-]\d{2})\s+(\d{2}:\d{2})/
+  const nameRE   = /^[A-Za-z][A-Za-z\s'\-\.]{1,30}$/
+  let cols = {}
+
+  for (let r = headerIdx + 1; r < Math.min(headerIdx + 15, data.length); r++) {
+    const row = data[r]
+    // Find datetime column
+    const dtCol = row.findIndex(c => dtScanRE.test(String(c).trim()))
+    if (dtCol < 0) continue
+    // Find name column: nearest column before dtCol that looks like a name
+    let nameCol = -1
+    for (let c = dtCol - 1; c >= 0; c--) {
+      const val = String(row[c]).trim()
+      if (val && nameRE.test(val)) { nameCol = c; break }
+    }
+    if (nameCol >= 0) {
+      cols = { name: nameCol, datetime: dtCol }
+      break
     }
   }
 
-  // If still not found, scan data rows for datetime pattern and name-like column
-  if (headerIdx === -1) {
-    const dtRE = /\d{4}[\/\-]\d{2}[\/\-]\d{2}\s+\d{2}:\d{2}/
-    for (let r = 0; r < Math.min(10, data.length); r++) {
-      const row = data[r]
-      const dtCol = row.findIndex(c => dtRE.test(String(c)))
-      if (dtCol > 0) {
-        // Name is likely the column before datetime that has letters
-        let nameCol = dtCol - 1
-        for (let c = dtCol - 1; c >= 0; c--) {
-          if (/[a-zA-Z]{2,}/.test(String(row[c]))) { nameCol = c; break }
-        }
-        cols = { name: nameCol, datetime: dtCol }
-        headerIdx = r - 1 // treat this row as first data row
-        break
-      }
+  // Fallback: try header-based detection if data scan failed
+  if (!cols.datetime) {
+    const heuristics = {
+      name:     /^(name|uname|u\.?name|nama)$/i,
+      datetime: /^(date\s*[-\/]?\s*time|datetime|tanggal\s*jam)$/i,
+      date:     /^(date|tanggal)$/i,
+      time:     /^(time|jam)$/i,
     }
-    if (headerIdx === -1) {
-      // Last resort: assume No(0) Name(1) Date(2) Time(3)
-      cols = { id: 0, name: 1, date: 2, time: 3 }
-      headerIdx = 0
-    }
+    const hRow = data[headerIdx].map(c => String(c).toLowerCase().trim())
+    hRow.forEach((cell, i) => {
+      if (heuristics.name.test(cell))     cols.name     = i
+      if (heuristics.datetime.test(cell)) cols.datetime = i
+      if (heuristics.date.test(cell))     cols.date     = i
+      if (heuristics.time.test(cell))     cols.time     = i
+    })
   }
+
+  // Last resort defaults
+  if (cols.name === undefined) cols = { id: 0, name: 1, date: 2, time: 3 }
 
   const timeRE = /(\d{2}:\d{2})/
   const dtFullRE = /(\d{4}[\/\-]\d{2}[\/\-]\d{2})\s+(\d{2}:\d{2})/
@@ -1266,7 +1266,7 @@ function cleanOcrText(raw) {
 
 /* ── Upload Tab ── */
 function UploadTab({ settings, onParsed, fileInfo, setFileInfo }) {
-  const [mode, setMode]           = useState('file')
+  const [mode, setMode]           = useState('paste')
   const [drag, setDrag]           = useState(false)
   const [error, setError]         = useState('')
   const [loading, setLoading]     = useState(false)
